@@ -7,6 +7,7 @@ import javax.swing.JComboBox;
 import javax.swing.JTextField;
 import javax.swing.text.Document;
 import java.awt.Component;
+import java.awt.event.ActionListener;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -17,7 +18,7 @@ public class HistoryTextField extends JComboBox<String> {
     public HistoryTextField(String historyKey) {
         this.historyKey = historyKey;
         setEditable(true);
-        setPrototypeDisplayValue("MMMMMMMMMMMMMMMMMMMMMMMM");
+        setPrototypeDisplayValue("MMMMMMMMMMMM");
         loadFromStore();
     }
 
@@ -38,6 +39,13 @@ public class HistoryTextField extends JComboBox<String> {
     public Document getDocument() {
         JTextField editor = getEditorField();
         return editor != null ? editor.getDocument() : null;
+    }
+
+    public void addEditorActionListener(ActionListener listener) {
+        JTextField editor = getEditorField();
+        if (editor != null) {
+            editor.addActionListener(listener);
+        }
     }
 
     public void commitHistory() {

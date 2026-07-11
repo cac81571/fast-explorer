@@ -25,6 +25,7 @@ public final class TextGrepService {
 
     private static final long MAX_FILE_BYTES = 2 * 1024 * 1024L;
     private static final int MAX_MATCHES = 10_000;
+    private static final int MAX_DISPLAY_ROWS = 50_000;
     private static final int MAX_LINE_DISPLAY = 300;
 
     public GrepResult grep(
@@ -33,6 +34,7 @@ public final class TextGrepService {
             boolean regex,
             boolean caseSensitive,
             boolean recursive,
+            int contextLines,
             AtomicBoolean cancel
     ) throws IOException {
         long start = System.nanoTime();
@@ -50,7 +52,7 @@ public final class TextGrepService {
                     if (cancel.get() || matches.size() >= MAX_MATCHES) {
                         return FileVisitResult.TERMINATE;
                     }
-                    scanFile(file, attrs, options, fileNamePattern, linePattern, matches, filesScanned, cancel);
+                    scanFile(file, attrs, options, fileNamePattern, linePattern, contextLines, matches, filesScanned, cancel);
                     return FileVisitResult.CONTINUE;
                 }
 
@@ -69,7 +71,7 @@ public final class TextGrepService {
                         try {
                             BasicFileAttributes attrs = Files.readAttributes(
                                     entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                            scanFile(entry, attrs, options, fileNamePattern, linePattern, matches, filesScanned, cancel);
+                            scanFile(entry, attrs, options, fileNamePattern, linePattern, contextLines, matches, filesScanned, cancel);
                         } catch (IOException ignored) {
                         }
                     }
@@ -87,6 +89,7 @@ public final class TextGrepService {
             String patternText,
             boolean regex,
             boolean caseSensitive,
+            int contextLines,
             AtomicBoolean cancel
     ) throws IOException {
         long start = System.nanoTime();
@@ -106,7 +109,7 @@ public final class TextGrepService {
                 }
                 BasicFileAttributes attrs = Files.readAttributes(
                         file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                scanFile(file, attrs, options, fileNamePattern, linePattern, matches, filesScanned, cancel);
+                scanFile(file, attrs, options, fileNamePattern, linePattern, contextLines, matches, filesScanned, cancel);
             } catch (IOException ignored) {
                 // 個別ファイルの失敗でファイル集合全体の Grep を中断しない
             }
@@ -122,6 +125,7 @@ public final class TextGrepService {
             GrepOptions options,
             Pattern fileNamePattern,
             Pattern linePattern,
+            int contextLines,
             List<GrepMatch> matches,
             int[] filesScanned,
             AtomicBoolean cancel
@@ -137,7 +141,7 @@ public final class TextGrepService {
             return;
         }
         filesScanned[0]++;
-        grepFile(file, linePattern, matches, cancel);
+        grepFile(file, linePattern, contextLines, matches, cancel);
     }
 
     static boolean matchesExtension(Path file, List<String> extensions) {
@@ -157,12 +161,13 @@ public final class TextGrepService {
     private static void grepFile(
             Path file,
             Pattern pattern,
+            int contextLines,
             List<GrepMatch> matches,
             AtomicBoolean cancel
     ) {
         for (Charset charset : charsetsToTry()) {
             try {
-                grepFileWithCharset(file, pattern, matches, cancel, charset);
+                grepFileWithCharset(file, pattern, contextLines, matches, cancel, charset);
                 return;
             } catch (MalformedInputException ignored) {
             } catch (IOException ignored) {
@@ -185,22 +190,65 @@ public final class TextGrepService {
     private static void grepFileWithCharset(
             Path file,
             Pattern pattern,
+            int contextLines,
             List<GrepMatch> matches,
             AtomicBoolean cancel,
             Charset charset
     ) throws IOException {
+        List<String> lines = new ArrayList<>();
         try (BufferedReader reader = Files.newBufferedReader(file, charset)) {
             String line;
-            int lineNumber = 0;
             while ((line = reader.readLine()) != null) {
+                if (cancel.get()) {
+                    return;
+                }
+                lines.add(line);
+            }
+        }
+
+        List<Integer> matchIndices = new ArrayList<>();
+        for (int i = 0; i < lines.size(); i++) {
+            if (cancel.get() || matchIndices.size() >= MAX_MATCHES) {
+                break;
+            }
+            if (pattern.matcher(lines.get(i)).find()) {
+                matchIndices.add(i);
+            }
+        }
+        if (matchIndices.isEmpty()) {
+            return;
+        }
+
+        int normalizedContext = Math.max(0, contextLines);
+        if (normalizedContext == 0) {
+            for (int index : matchIndices) {
                 if (cancel.get() || matches.size() >= MAX_MATCHES) {
                     return;
                 }
-                lineNumber++;
-                if (pattern.matcher(line).find()) {
-                    matches.add(new GrepMatch(file, lineNumber, truncateLine(line)));
-                }
+                matches.add(new GrepMatch(file, index + 1, truncateLine(lines.get(index)), true));
             }
+            return;
+        }
+
+        boolean[] include = new boolean[lines.size()];
+        boolean[] isMatch = new boolean[lines.size()];
+        for (int index : matchIndices) {
+            isMatch[index] = true;
+            int from = Math.max(0, index - normalizedContext);
+            int to = Math.min(lines.size() - 1, index + normalizedContext);
+            for (int i = from; i <= to; i++) {
+                include[i] = true;
+            }
+        }
+
+        for (int i = 0; i < lines.size(); i++) {
+            if (cancel.get() || matches.size() >= MAX_DISPLAY_ROWS) {
+                return;
+            }
+            if (!include[i]) {
+                continue;
+            }
+            matches.add(new GrepMatch(file, i + 1, truncateLine(lines.get(i)), isMatch[i]));
         }
     }
 

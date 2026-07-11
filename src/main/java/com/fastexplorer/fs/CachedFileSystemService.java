@@ -128,9 +128,10 @@ public final class CachedFileSystemService {
             boolean regex,
             boolean caseSensitive,
             boolean recursive,
+            int contextLines,
             AtomicBoolean cancel
     ) throws IOException {
-        return grepService.grep(options, pattern, regex, caseSensitive, recursive, cancel);
+        return grepService.grep(options, pattern, regex, caseSensitive, recursive, contextLines, cancel);
     }
 
     public GrepResult grepPaths(
@@ -139,9 +140,10 @@ public final class CachedFileSystemService {
             String pattern,
             boolean regex,
             boolean caseSensitive,
+            int contextLines,
             AtomicBoolean cancel
     ) throws IOException {
-        return grepService.grepPaths(paths, options, pattern, regex, caseSensitive, cancel);
+        return grepService.grepPaths(paths, options, pattern, regex, caseSensitive, contextLines, cancel);
     }
 
     public CacheRepository.CacheStats getCacheStats() throws SQLException {

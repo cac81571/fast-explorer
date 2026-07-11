@@ -30,6 +30,16 @@ final class GrepResultTableModel extends AbstractTableModel {
         return matches;
     }
 
+    int matchCount() {
+        int count = 0;
+        for (GrepMatch match : matches) {
+            if (match.matched()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     Path getDisplayBase() {
         return displayBase;
     }
@@ -59,9 +69,13 @@ final class GrepResultTableModel extends AbstractTableModel {
             case 0 -> PathUtil.toDisplay(match.path());
             case 1 -> fileName(match);
             case 2 -> match.lineNumber();
-            case 3 -> match.line();
+            case 3 -> formatLineContent(match);
             default -> "";
         };
+    }
+
+    private static String formatLineContent(GrepMatch match) {
+        return (match.matched() ? ": " : "- ") + match.line();
     }
 
     @Override
