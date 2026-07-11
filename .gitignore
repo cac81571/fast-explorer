@@ -1,0 +1,17 @@
+# Maven
+target/
+*.class
+*.jar
+!target/FastExplorer.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Java build output
+release-java/
+
+# OS
+.DS_Store
+*.log

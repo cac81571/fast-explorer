@@ -1,0 +1,1926 @@
+package com.fastexplorer.ui;
+
+import com.fastexplorer.config.PathHistoryStore;
+import com.fastexplorer.fs.CachedFileSystemService;
+import com.fastexplorer.model.FileEntry;
+import com.fastexplorer.model.GrepMatch;
+import com.fastexplorer.model.GrepOptions;
+import com.fastexplorer.model.GrepResult;
+import com.fastexplorer.model.ListDirectoryResult;
+import com.fastexplorer.model.SearchOptions;
+import com.fastexplorer.model.SearchResult;
+import com.fastexplorer.util.FileTypeUtil;
+import com.fastexplorer.util.LocalFileOpener;
+import com.fastexplorer.util.PathUtil;
+import com.fastexplorer.util.SearchMatcher;
+
+import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import javax.swing.table.AbstractTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.TableModel;
+import javax.swing.table.TableRowSorter;
+import java.awt.*;
+import java.awt.datatransfer.StringSelection;
+import java.awt.event.ItemEvent;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+public class ExplorerFrame extends JFrame {
+
+    private static final Color FOLDER_COLOR = new Color(28, 100, 171);
+    private static final Color TEXT_FILE_COLOR = new Color(0, 120, 70);
+    private static final Color BINARY_FILE_COLOR = new Color(140, 75, 30);
+
+    private static final DateTimeFormatter DATE_FMT =
+            DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm").withZone(ZoneId.systemDefault());
+
+    private static final int MAX_PATH_HISTORY = PathHistoryStore.MAX_ENTRIES;
+
+    private final CachedFileSystemService fs = new CachedFileSystemService();
+    private final FileTableModel tableModel = new FileTableModel();
+    private TableRowSorter<TableModel> tableSorter;
+    private final JTable table = new JTable(tableModel);
+    private final JTabbedPane resultTabs = new JTabbedPane();
+    private final JScrollPane mainTableScrollPane = new JScrollPane(table);
+    private final HistoryTextField grepField = new HistoryTextField("grep.pattern");
+    private final HistoryTextField grepPathField = new HistoryTextField("grep.path");
+    private final HistoryTextField grepFileNameField = new HistoryTextField("grep.file");
+    private final HistoryTextField grepExtensionField = new HistoryTextField("grep.extension");
+    private final JCheckBox grepRegexCheck = new JCheckBox("正規表現", false);
+    private final JCheckBox grepRecursiveCheck = new JCheckBox("サブフォルダ", true);
+    private final JButton grepBtn = new JButton("Grep");
+    private final JComboBox<String> pathCombo = new JComboBox<>();
+    private final HistoryTextField searchPathField = new HistoryTextField("search.path");
+    private final HistoryTextField searchFileNameField = new HistoryTextField("search.file");
+    private final HistoryTextField searchExtensionField = new HistoryTextField("search.extension");
+    private final JLabel statusLabel = new JLabel(" ");
+    private final JCheckBox subfolderSearchCheck = new JCheckBox("サブフォルダも検索", true);
+    private final JButton backBtn = new JButton("←");
+    private final JButton forwardBtn = new JButton("→");
+    private final JButton upBtn = new JButton("↑");
+    private final JButton refreshBtn = new JButton("↻");
+    private static final String GREP_TAB_PREFIX = "Grep結果";
+    private static final String FILE_LIST_TAB_PREFIX = "ファイルリスト";
+    private static final String FILE_LIST_NEW_TAB = "新規タブ";
+
+    private final JComboBox<String> targetTabCombo = new JComboBox<>();
+    private final JButton addResultTabBtn = new JButton("ファイルリスト追加");
+    private int nextGrepResultNumber = 1;
+    private int nextFileListNumber = 1;
+
+    private final List<Path> history = new ArrayList<>();
+    private int historyIndex = -1;
+    private Path currentPath;
+    private boolean loading;
+    private int totalEntryCount;
+    private SwingWorker<?, ?> activeWorker;
+    private final AtomicBoolean searchCancel = new AtomicBoolean();
+    private boolean updatingPathCombo;
+
+    private final List<HistoryTextField> historyFields = List.of(
+            grepField,
+            grepPathField,
+            grepFileNameField,
+            grepExtensionField,
+            searchPathField,
+            searchFileNameField,
+            searchExtensionField
+    );
+
+    public ExplorerFrame() {
+        super("Fast Explorer");
+        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        setSize(1200, 800);
+        setMinimumSize(new Dimension(800, 500));
+        setLocationRelativeTo(null);
+
+        initTable();
+        initToolbar();
+        initLayout();
+        installWindowListeners();
+        restorePathHistoryAndNavigate();
+    }
+
+    private void installWindowListeners() {
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                persistPathHistory();
+                persistInputHistory();
+                fs.shutdown();
+            }
+        });
+    }
+
+    private void restorePathHistoryAndNavigate() {
+        PathHistoryStore.State saved = PathHistoryStore.load();
+
+        updatingPathCombo = true;
+        try {
+            DefaultComboBoxModel<String> model = (DefaultComboBoxModel<String>) pathCombo.getModel();
+            for (String path : saved.history()) {
+                model.addElement(path);
+            }
+            if (!saved.lastPath().isBlank()) {
+                setPathComboText(saved.lastPath());
+            }
+        } finally {
+            updatingPathCombo = false;
+        }
+
+        Path startupPath = resolveStartupPath(saved.lastPath());
+        if (saved.lastPath().isBlank()) {
+            setPathComboText(PathUtil.toDisplay(startupPath));
+        }
+        loadDirectory(startupPath, true, false);
+    }
+
+    private Path resolveStartupPath(String lastPath) {
+        Path fallback = Paths.get(System.getProperty("user.home"));
+        if (lastPath == null || lastPath.isBlank()) {
+            return fallback;
+        }
+        try {
+            Path parsed = PathUtil.parse(lastPath);
+            Path resolved = PathUtil.resolveForAccess(parsed);
+            if (Files.isDirectory(resolved)) {
+                return parsed;
+            }
+        } catch (IOException | RuntimeException ignored) {
+        }
+        return fallback;
+    }
+
+    private void initTable() {
+        table.setRowHeight(28);
+        table.setShowGrid(false);
+        table.setIntercellSpacing(new Dimension(0, 0));
+        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        tableSorter = new TableRowSorter<>(tableModel);
+        table.setRowSorter(tableSorter);
+        table.getTableHeader().setReorderingAllowed(false);
+        configureTableColumns();
+        installFileEntryRenderer();
+        initContextMenu();
+
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    FileEntry entry = getEntryAtPoint(e.getPoint());
+                    if (entry != null) {
+                        openEntry(entry);
+                    }
+                }
+            }
+        });
+    }
+
+    private void initContextMenu() {
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem openServerFileItem = new JMenuItem("サーバのファイルを開く");
+        openServerFileItem.addActionListener(e -> {
+            FileEntry entry = getSelectedEntry();
+            if (entry != null && !entry.directory()) {
+                openFileOnServer(entry.path());
+            }
+        });
+        JMenuItem copyPathItem = new JMenuItem("パスのコピー");
+        copyPathItem.addActionListener(e -> {
+            FileEntry entry = getSelectedEntry();
+            if (entry != null) {
+                copyToClipboard(entry.path().toString());
+            }
+        });
+        popup.add(openServerFileItem);
+        popup.add(copyPathItem);
+
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                showPopup(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                showPopup(e);
+            }
+
+            private void showPopup(MouseEvent e) {
+                if (!e.isPopupTrigger()) {
+                    return;
+                }
+                int viewRow = table.rowAtPoint(e.getPoint());
+                if (viewRow < 0) {
+                    return;
+                }
+                table.setRowSelectionInterval(viewRow, viewRow);
+                FileEntry entry = getSelectedEntry();
+                openServerFileItem.setVisible(entry != null
+                        && !entry.directory()
+                        && PathUtil.isUnc(entry.path()));
+                popup.show(e.getComponent(), e.getX(), e.getY());
+            }
+        });
+    }
+
+    private FileEntry getEntryAtPoint(Point point) {
+        int viewRow = table.rowAtPoint(point);
+        if (viewRow < 0) {
+            return null;
+        }
+        return tableModel.getEntry(table.convertRowIndexToModel(viewRow));
+    }
+
+    private FileEntry getSelectedEntry() {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
+            return null;
+        }
+        return tableModel.getEntry(table.convertRowIndexToModel(viewRow));
+    }
+
+    private void copyToClipboard(String text) {
+        StringSelection selection = new StringSelection(text);
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, selection);
+        statusLabel.setText("コピーしました: " + text);
+    }
+
+    private void installFileEntryRenderer() {
+        table.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
+            @Override
+            public Component getTableCellRendererComponent(
+                    JTable t, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
+                Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column);
+                if (t.getModel() == tableModel) {
+                    int modelRow = t.convertRowIndexToModel(row);
+                    FileEntry entry = tableModel.getEntry(modelRow);
+                    if (entry == null) {
+                        return c;
+                    }
+                    if (isSelected) {
+                        c.setForeground(t.getSelectionForeground());
+                        c.setBackground(t.getSelectionBackground());
+                    } else if (entry.directory()) {
+                        c.setForeground(FOLDER_COLOR);
+                        c.setBackground(t.getBackground());
+                    } else if (FileTypeUtil.isTextFile(entry.name())) {
+                        c.setForeground(TEXT_FILE_COLOR);
+                        c.setBackground(t.getBackground());
+                    } else {
+                        c.setForeground(BINARY_FILE_COLOR);
+                        c.setBackground(t.getBackground());
+                    }
+                }
+                return c;
+            }
+        });
+    }
+
+    private void configureTableColumns() {
+        table.getColumnModel().getColumn(0).setPreferredWidth(320);
+        table.getColumnModel().getColumn(1).setPreferredWidth(80);
+        table.getColumnModel().getColumn(2).setPreferredWidth(100);
+        DefaultTableCellRenderer rightRenderer = new DefaultTableCellRenderer();
+        rightRenderer.setHorizontalAlignment(SwingConstants.RIGHT);
+        table.getColumnModel().getColumn(2).setCellRenderer(rightRenderer);
+        table.getColumnModel().getColumn(3).setPreferredWidth(160);
+    }
+
+    private void initToolbar() {
+        backBtn.setToolTipText("戻る");
+        forwardBtn.setToolTipText("進む");
+        upBtn.setToolTipText("上のフォルダ");
+        refreshBtn.setToolTipText("更新");
+        searchPathField.setToolTipText("相対パス（* ? で glob、カンマ区切り。ワイルドカードなしは部分一致）▼ で履歴");
+        searchFileNameField.setToolTipText("ファイル名（* ? で glob、カンマ区切り。ワイルドカードなしは部分一致）▼ で履歴");
+        searchExtensionField.setToolTipText("拡張子（カンマ区切り、例: .java,.xml または java,log、フォルダ）▼ で履歴");
+        subfolderSearchCheck.setToolTipText("ON のとき検索ボタン / Enter で現在のフォルダ以下を再帰検索");
+        addResultTabBtn.setToolTipText("Grep結果のファイルパスをファイルリストタブへ追加 / ファイルリストタブをマージ");
+        targetTabCombo.setToolTipText("追加先（新規タブ / ファイルリスト …）");
+        pathCombo.setEditable(true);
+        pathCombo.setToolTipText("パスを入力するか、履歴から選択");
+        grepField.setToolTipText("テキストファイル内を検索（Enter で実行）▼ で履歴");
+        grepPathField.setToolTipText("検索開始パス（空=現在のフォルダ、相対/絶対/UNC 可）▼ で履歴");
+        grepFileNameField.setToolTipText("対象ファイル名（ワイルドカード: * ? 例: *.java, test?.txt）▼ で履歴");
+        grepExtensionField.setToolTipText("拡張子（空=テキスト系すべて、例: .java,.xml または java,log）▼ で履歴");
+        grepRegexCheck.setToolTipText("正規表現として解釈");
+        grepRecursiveCheck.setToolTipText("サブフォルダ内も検索（エクスプローラタブ選択時）");
+
+        backBtn.addActionListener(e -> goBack());
+        forwardBtn.addActionListener(e -> goForward());
+        upBtn.addActionListener(e -> goUp());
+        refreshBtn.addActionListener(e -> {
+            if (currentPath != null) {
+                loadDirectory(currentPath, false, true);
+            }
+        });
+
+        pathCombo.addItemListener(e -> {
+            if (e.getStateChange() != ItemEvent.SELECTED || updatingPathCombo) {
+                return;
+            }
+            Object item = e.getItem();
+            if (item != null) {
+                navigateToPath(item.toString());
+            }
+        });
+
+        Component pathEditor = pathCombo.getEditor().getEditorComponent();
+        if (pathEditor instanceof JTextField editorField) {
+            editorField.addActionListener(e -> navigateToPath(getPathInput()));
+        }
+
+        installClearSearchShortcut(searchPathField);
+        installClearSearchShortcut(searchFileNameField);
+        installClearSearchShortcut(searchExtensionField);
+
+        java.awt.event.ActionListener searchEnterAction = e -> {
+            commitSearchFieldHistory();
+            if (subfolderSearchCheck.isSelected()) {
+                runSubfolderSearch();
+            }
+        };
+        searchPathField.addActionListener(searchEnterAction);
+        searchFileNameField.addActionListener(searchEnterAction);
+        searchExtensionField.addActionListener(searchEnterAction);
+
+        DocumentListener filterListener = new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                applyFilters();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                applyFilters();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                applyFilters();
+            }
+        };
+        searchPathField.getDocument().addDocumentListener(filterListener);
+        searchFileNameField.getDocument().addDocumentListener(filterListener);
+        searchExtensionField.getDocument().addDocumentListener(filterListener);
+
+        subfolderSearchCheck.addActionListener(e -> applyFilters());
+
+        addResultTabBtn.addActionListener(e -> addOrMergeFileListTab());
+
+        grepField.addActionListener(e -> runGrep());
+
+        resultTabs.addChangeListener(e -> onResultTabSelectionChanged());
+    }
+
+    private void initLayout() {
+        JPanel north = new JPanel();
+        north.setLayout(new BoxLayout(north, BoxLayout.Y_AXIS));
+
+        JPanel toolbar = new JPanel(new BorderLayout(8, 0));
+        toolbar.setBorder(BorderFactory.createEmptyBorder(8, 12, 4, 12));
+
+        JPanel nav = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        nav.add(backBtn);
+        nav.add(forwardBtn);
+        nav.add(upBtn);
+        nav.add(refreshBtn);
+
+        JPanel pathPanel = new JPanel(new BorderLayout(6, 0));
+        pathPanel.add(pathCombo, BorderLayout.CENTER);
+        JButton goBtn = new JButton("移動");
+        goBtn.addActionListener(e -> navigateToPath(getPathInput()));
+        pathPanel.add(goBtn, BorderLayout.EAST);
+
+        toolbar.add(nav, BorderLayout.WEST);
+        toolbar.add(pathPanel, BorderLayout.CENTER);
+
+        JPanel searchBar = new JPanel(new BorderLayout(8, 0));
+        searchBar.setBorder(BorderFactory.createEmptyBorder(4, 12, 8, 12));
+
+        JPanel searchFields = buildLabelFieldRow(
+                "パス", searchPathField,
+                "ファイル", searchFileNameField,
+                "拡張子", searchExtensionField
+        );
+        JPanel searchActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        searchActions.add(subfolderSearchCheck);
+        JButton searchBtn = new JButton("検索");
+        searchBtn.addActionListener(e -> runSubfolderSearch());
+        searchActions.add(searchBtn);
+
+        JPanel searchRow = new JPanel(new BorderLayout(8, 0));
+        searchRow.add(searchFields, BorderLayout.CENTER);
+        searchRow.add(searchActions, BorderLayout.EAST);
+        searchBar.add(searchRow, BorderLayout.CENTER);
+
+        north.add(toolbar);
+        north.add(searchBar);
+
+        JPanel grepBar = new JPanel();
+        grepBar.setLayout(new BoxLayout(grepBar, BoxLayout.Y_AXIS));
+        grepBar.setBorder(BorderFactory.createEmptyBorder(0, 12, 8, 12));
+
+        JPanel grepRow1 = new JPanel(new BorderLayout(6, 0));
+        grepRow1.add(new JLabel("Grep"), BorderLayout.WEST);
+        grepRow1.add(grepField, BorderLayout.CENTER);
+        JPanel grepActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        grepActions.add(grepRegexCheck);
+        grepActions.add(grepRecursiveCheck);
+        grepBtn.addActionListener(e -> runGrep());
+        grepActions.add(grepBtn);
+        grepRow1.add(grepActions, BorderLayout.EAST);
+
+        JPanel grepRow2 = buildLabelFieldRow(
+                "パス", grepPathField,
+                "ファイル", grepFileNameField,
+                "拡張子", grepExtensionField
+        );
+
+        JPanel grepRow3 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        grepRow3.add(new JLabel("追加先"));
+        grepRow3.add(targetTabCombo);
+        grepRow3.add(addResultTabBtn);
+
+        grepBar.add(grepRow1);
+        grepBar.add(Box.createVerticalStrut(4));
+        grepBar.add(grepRow2);
+        grepBar.add(Box.createVerticalStrut(4));
+        grepBar.add(grepRow3);
+        north.add(grepBar);
+
+        statusLabel.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+        statusLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+
+        getContentPane().setLayout(new BorderLayout());
+        getContentPane().add(north, BorderLayout.NORTH);
+        resultTabs.addTab("エクスプローラ", mainTableScrollPane);
+        installResultTabContextMenu();
+        updateTargetTabCombo();
+        onResultTabSelectionChanged();
+        getContentPane().add(resultTabs, BorderLayout.CENTER);
+        getContentPane().add(statusLabel, BorderLayout.SOUTH);
+    }
+
+    private JPanel buildLabelFieldRow(Object... labelAndField) {
+        JPanel row = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.gridy = 0;
+        gbc.anchor = GridBagConstraints.WEST;
+        for (int i = 0; i < labelAndField.length; i += 2) {
+            int pairIndex = i / 2;
+            gbc.gridx = pairIndex * 2;
+            gbc.weightx = 0;
+            gbc.fill = GridBagConstraints.NONE;
+            gbc.insets = new Insets(0, pairIndex == 0 ? 0 : 8, 0, 4);
+            row.add(new JLabel(String.valueOf(labelAndField[i])), gbc);
+
+            gbc.gridx = pairIndex * 2 + 1;
+            gbc.weightx = 1.0;
+            gbc.fill = GridBagConstraints.HORIZONTAL;
+            gbc.insets = new Insets(0, 0, 0, 8);
+            row.add((JComponent) labelAndField[i + 1], gbc);
+        }
+        return row;
+    }
+
+    private String getPathInput() {
+        Object item = pathCombo.getEditor().getItem();
+        return item != null ? item.toString().trim() : "";
+    }
+
+    private void setPathComboText(String path) {
+        updatingPathCombo = true;
+        try {
+            pathCombo.getEditor().setItem(path);
+            pathCombo.setSelectedItem(path);
+        } finally {
+            updatingPathCombo = false;
+        }
+    }
+
+    private void addToPathHistory(String path) {
+        if (path.isBlank()) {
+            return;
+        }
+        updatingPathCombo = true;
+        try {
+            DefaultComboBoxModel<String> model = (DefaultComboBoxModel<String>) pathCombo.getModel();
+            for (int i = 0; i < model.getSize(); i++) {
+                if (path.equals(model.getElementAt(i))) {
+                    model.removeElementAt(i);
+                    break;
+                }
+            }
+            model.insertElementAt(path, 0);
+            while (model.getSize() > MAX_PATH_HISTORY) {
+                model.removeElementAt(model.getSize() - 1);
+            }
+            pathCombo.getEditor().setItem(path);
+            pathCombo.setSelectedItem(path);
+            persistPathHistory();
+        } finally {
+            updatingPathCombo = false;
+        }
+    }
+
+    private List<String> getPathHistoryItems() {
+        DefaultComboBoxModel<String> model = (DefaultComboBoxModel<String>) pathCombo.getModel();
+        List<String> items = new ArrayList<>(model.getSize());
+        for (int i = 0; i < model.getSize(); i++) {
+            items.add(model.getElementAt(i));
+        }
+        return items;
+    }
+
+    private void persistPathHistory() {
+        PathHistoryStore.save(getPathInput(), getPathHistoryItems());
+    }
+
+    private void navigateToPath(String text) {
+        if (text.isBlank()) {
+            return;
+        }
+        try {
+            Path path = PathUtil.parse(text);
+            if (PathUtil.isSame(path, currentPath)) {
+                setPathComboText(PathUtil.toDisplay(path));
+                showExplorerTab();
+                return;
+            }
+            clearNavigationState();
+            loadDirectory(path, true, false);
+        } catch (Exception ex) {
+            showError("パスが無効です: " + text);
+        }
+    }
+
+    private void showExplorerTab() {
+        if (resultTabs.getSelectedIndex() != 0) {
+            resultTabs.setSelectedIndex(0);
+        }
+    }
+
+    private void loadDirectory(Path path, boolean pushHistory, boolean forceRefresh) {
+        final Path normalizedPath = path.toAbsolutePath().normalize();
+        cancelActiveWorker();
+        tableModel.setDisplayBase(null);
+        loading = true;
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        statusLabel.setText(forceRefresh ? "更新中…" : "読み込み中…");
+
+        boolean includeSize = true;
+        final Path requestedPath = normalizedPath;
+
+        SwingWorker<ListDirectoryResult, Void> worker = new SwingWorker<>() {
+            @Override
+            protected ListDirectoryResult doInBackground() throws Exception {
+                return fs.listDirectory(normalizedPath, includeSize, forceRefresh, fresh -> SwingUtilities.invokeLater(() -> {
+                    if (PathUtil.isSame(fresh.path(), requestedPath)) {
+                        applyDirectoryResult(fresh, false);
+                    }
+                }));
+            }
+
+            @Override
+            protected void done() {
+                finishActiveWorker(this, result -> applyDirectoryResult(result, pushHistory));
+            }
+        };
+        activeWorker = worker;
+        worker.execute();
+    }
+
+    private void applyDirectoryResult(ListDirectoryResult result, boolean pushHistory) {
+        currentPath = result.path().toAbsolutePath().normalize();
+        addToPathHistory(PathUtil.toDisplay(currentPath));
+        totalEntryCount = result.entries().size();
+        tableModel.setEntries(result.entries());
+        configureTableColumns();
+        applyFilters();
+        if (buildSearchOptions().isEmpty()) {
+            updateStatusBar(result.elapsedMs(), buildDirectoryMode(result));
+        }
+        updateNavButtons();
+
+        if (pushHistory) {
+            if (historyIndex < history.size() - 1) {
+                history.subList(historyIndex + 1, history.size()).clear();
+            }
+            if (history.isEmpty() || !history.get(history.size() - 1).equals(result.path())) {
+                history.add(result.path());
+                historyIndex = history.size() - 1;
+            }
+        }
+        updateNavButtons();
+        showExplorerTab();
+    }
+
+    private static String buildDirectoryMode(ListDirectoryResult result) {
+        if (result.backgroundRefresh()) {
+            return "更新完了";
+        }
+        if (result.fromCache()) {
+            return "H2 キャッシュ";
+        }
+        return "ネットワーク";
+    }
+
+    private void runSubfolderSearch() {
+        runSubfolderSearch(false);
+    }
+
+    private void runSubfolderSearch(boolean forceRefresh) {
+        if (currentPath == null || loading) {
+            return;
+        }
+
+        SearchOptions options = buildSearchOptions();
+        if (options.isEmpty()) {
+            return;
+        }
+
+        commitSearchFieldHistory();
+
+        if (!subfolderSearchCheck.isSelected()) {
+            applyFilters();
+            return;
+        }
+
+        cancelActiveWorker();
+        searchCancel.set(false);
+
+        loading = true;
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        statusLabel.setText("検索中… " + formatSearchCriteria(options));
+
+        final ResultTabPanel[] searchTab = new ResultTabPanel[1];
+        final SearchOptions searchOptions = options;
+        SwingWorker<SearchResult, Void> worker = new SwingWorker<>() {
+            @Override
+            protected SearchResult doInBackground() throws Exception {
+                return fs.searchRecursive(currentPath, searchOptions, searchCancel, forceRefresh, fresh ->
+                        SwingUtilities.invokeLater(() -> applySearchResult(fresh, searchTab)));
+            }
+
+            @Override
+            protected void done() {
+                finishActiveWorker(this, result -> applySearchResult(result, searchTab));
+            }
+        };
+        activeWorker = worker;
+        worker.execute();
+    }
+
+    private void applySearchResult(SearchResult result, ResultTabPanel[] tabHolder) {
+        if (searchCancel.get()) {
+            return;
+        }
+        List<FileEntry> entries = result.entries();
+        if (entries.isEmpty()) {
+            if (tabHolder[0] == null) {
+                JOptionPane.showMessageDialog(
+                        this,
+                        "検索条件に一致するファイルがありません",
+                        "検索",
+                        JOptionPane.INFORMATION_MESSAGE
+                );
+                statusLabel.setText("検索結果 0 件");
+            } else {
+                tabHolder[0].setFileEntries(List.of(), null, false);
+                String mode = result.fromCache() ? "サブフォルダ検索 (H2 キャッシュ)" : "サブフォルダ検索";
+                statusLabel.setText(tabHolder[0].statusText() + "  |  " + result.elapsedMs() + " ms  |  " + mode);
+                resultTabs.setSelectedComponent(tabHolder[0]);
+                onResultTabSelectionChanged();
+            }
+            return;
+        }
+
+        if (tabHolder[0] == null) {
+            tabHolder[0] = new ResultTabPanel(ResultTabKind.FILE_LIST);
+            resultTabs.addTab(allocateFileListTitle(), tabHolder[0]);
+            updateTargetTabCombo();
+        }
+        String mode = result.fromCache() ? "サブフォルダ検索 (H2 キャッシュ)" : "サブフォルダ検索";
+        tabHolder[0].setFileEntries(entries, null, false);
+        resultTabs.setSelectedComponent(tabHolder[0]);
+        statusLabel.setText(tabHolder[0].statusText() + "  |  " + result.elapsedMs() + " ms  |  " + mode);
+        onResultTabSelectionChanged();
+    }
+
+    private void applyFilters() {
+        SearchOptions options = buildSearchOptions();
+        if (subfolderSearchCheck.isSelected()) {
+            tableSorter.setRowFilter(null);
+            return;
+        }
+        if (options.isEmpty() || currentPath == null) {
+            tableSorter.setRowFilter(null);
+            updateStatusBar(null, "フォルダ一覧");
+            return;
+        }
+
+        Path root = currentPath.toAbsolutePath().normalize();
+        tableSorter.setRowFilter(new RowFilter<Object, Object>() {
+            @Override
+            public boolean include(Entry<?, ?> entry) {
+                int row = (Integer) entry.getIdentifier();
+                FileEntry fileEntry = tableModel.getEntry(row);
+                if (fileEntry == null) {
+                    return false;
+                }
+                return SearchMatcher.matches(
+                        root,
+                        fileEntry.path(),
+                        fileEntry.name(),
+                        fileEntry.directory(),
+                        options
+                );
+            }
+        });
+        updateStatusBar(null, "絞り込み");
+    }
+
+    private SearchOptions buildSearchOptions() {
+        return new SearchOptions(
+                parseCommaList(searchPathField.getText()),
+                parseCommaList(searchFileNameField.getText()),
+                parseCommaList(searchExtensionField.getText())
+        );
+    }
+
+    private static List<String> parseCommaList(String text) {
+        if (text == null || text.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(text.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+    }
+
+    private static String formatSearchCriteria(SearchOptions options) {
+        List<String> parts = new ArrayList<>();
+        if (!options.pathPatterns().isEmpty()) {
+            parts.add("パス=" + String.join("|", options.pathPatterns()));
+        }
+        if (!options.fileNamePatterns().isEmpty()) {
+            parts.add("ファイル=" + String.join("|", options.fileNamePatterns()));
+        }
+        if (!options.extensions().isEmpty()) {
+            parts.add("拡張子=" + String.join("|", options.extensions()));
+        }
+        return String.join(" ", parts);
+    }
+
+    private void persistInputHistory() {
+        for (HistoryTextField field : historyFields) {
+            field.persistHistory();
+        }
+    }
+
+    private void commitSearchFieldHistory() {
+        searchPathField.commitHistory();
+        searchFileNameField.commitHistory();
+        searchExtensionField.commitHistory();
+    }
+
+    private void commitGrepFieldHistory() {
+        grepField.commitHistory();
+        grepPathField.commitHistory();
+        grepFileNameField.commitHistory();
+        grepExtensionField.commitHistory();
+    }
+
+    private void installClearSearchShortcut(HistoryTextField field) {
+        JTextField editor = field.getEditorField();
+        if (editor == null) {
+            return;
+        }
+        editor.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "clearSearch");
+        editor.getActionMap().put("clearSearch", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                clearSearch();
+                if (currentPath != null) {
+                    loadDirectory(currentPath, false, false);
+                }
+            }
+        });
+    }
+
+    private void clearNavigationState() {
+        searchCancel.set(true);
+        searchPathField.setText("");
+        searchFileNameField.setText("");
+        searchExtensionField.setText("");
+        tableSorter.setRowFilter(null);
+        tableModel.setDisplayBase(null);
+    }
+
+    private void clearSearch() {
+        clearNavigationState();
+        grepField.setText("");
+        grepPathField.setText("");
+        grepFileNameField.setText("");
+        grepExtensionField.setText("");
+    }
+
+    private void addOrMergeFileListTab() {
+        ResultTabPanel selected = getSelectedResultTab();
+        if (selected == null) {
+            return;
+        }
+        if (selected.kind() == ResultTabKind.GREP_RESULT) {
+            addGrepFilesToFileListTab();
+        } else if (selected.kind() == ResultTabKind.FILE_LIST) {
+            mergeFileListTab();
+        }
+    }
+
+    private void addGrepFilesToFileListTab() {
+        ResultTabPanel grepTab = getSelectedGrepResultTab();
+        if (grepTab == null) {
+            statusLabel.setText("Grep結果タブを選択してください");
+            return;
+        }
+
+        List<FileEntry> entries = pathsToFileEntries(grepTab.scopePaths());
+        if (entries.isEmpty()) {
+            statusLabel.setText("追加できるファイルがありません");
+            return;
+        }
+
+        Object selected = targetTabCombo.getSelectedItem();
+        String target = selected != null ? selected.toString() : FILE_LIST_NEW_TAB;
+        if (FILE_LIST_NEW_TAB.equals(target)) {
+            ResultTabPanel panel = new ResultTabPanel(ResultTabKind.FILE_LIST);
+            panel.setFileEntries(entries, null, false);
+            resultTabs.addTab(allocateFileListTitle(), panel);
+            resultTabs.setSelectedComponent(panel);
+        } else {
+            int index = findTabIndexByTitle(target);
+            if (index < 0) {
+                statusLabel.setText("追加先タブが見つかりません");
+                return;
+            }
+            ResultTabPanel panel = getResultTabAt(index);
+            if (panel == null || panel.kind() != ResultTabKind.FILE_LIST) {
+                statusLabel.setText("ファイルリストタブを選択してください");
+                return;
+            }
+            panel.setFileEntries(entries, null, true);
+            resultTabs.setSelectedIndex(index);
+        }
+        updateTargetTabCombo();
+        onResultTabSelectionChanged();
+    }
+
+    private void mergeFileListTab() {
+        int sourceIndex = resultTabs.getSelectedIndex();
+        ResultTabPanel sourceTab = getSelectedFileListTab();
+        if (sourceTab == null) {
+            statusLabel.setText("ファイルリストタブを選択してください");
+            return;
+        }
+
+        List<FileEntry> entries = sourceTab.fileEntries();
+        if (entries.isEmpty()) {
+            statusLabel.setText("マージできるファイルがありません");
+            return;
+        }
+
+        Object selected = targetTabCombo.getSelectedItem();
+        String target = selected != null ? selected.toString() : FILE_LIST_NEW_TAB;
+        if (FILE_LIST_NEW_TAB.equals(target)) {
+            ResultTabPanel panel = new ResultTabPanel(ResultTabKind.FILE_LIST);
+            panel.setFileEntries(entries, null, false);
+            resultTabs.addTab(allocateFileListTitle(), panel);
+            resultTabs.setSelectedComponent(panel);
+        } else {
+            int targetIndex = findTabIndexByTitle(target);
+            if (targetIndex < 0) {
+                statusLabel.setText("追加先タブが見つかりません");
+                return;
+            }
+            ResultTabPanel targetPanel = getResultTabAt(targetIndex);
+            if (targetPanel == null || targetPanel.kind() != ResultTabKind.FILE_LIST) {
+                statusLabel.setText("追加先タブが見つかりません");
+                return;
+            }
+            targetPanel.setFileEntries(entries, null, true);
+            resultTabs.removeTabAt(sourceIndex);
+            targetIndex = findTabIndexByTitle(target);
+            if (targetIndex >= 0) {
+                resultTabs.setSelectedIndex(targetIndex);
+            }
+        }
+        updateTargetTabCombo();
+        onResultTabSelectionChanged();
+    }
+
+    private List<FileEntry> pathsToFileEntries(Collection<Path> paths) {
+        Map<Path, FileEntry> unique = new LinkedHashMap<>();
+        for (Path path : paths) {
+            FileEntry entry = fs.toFileEntry(path);
+            unique.putIfAbsent(entry.path().toAbsolutePath().normalize(), entry);
+        }
+        return new ArrayList<>(unique.values());
+    }
+
+    private void updateTargetTabCombo() {
+        String previous = targetTabCombo.getSelectedItem() != null
+                ? targetTabCombo.getSelectedItem().toString()
+                : FILE_LIST_NEW_TAB;
+        ResultTabPanel selected = getSelectedResultTab();
+        String excludeTitle = null;
+        if (selected != null && selected.kind() == ResultTabKind.FILE_LIST) {
+            int selectedIndex = resultTabs.getSelectedIndex();
+            if (selectedIndex >= 0) {
+                excludeTitle = resultTabs.getTitleAt(selectedIndex);
+            }
+        }
+        DefaultComboBoxModel<String> model = new DefaultComboBoxModel<>();
+        model.addElement(FILE_LIST_NEW_TAB);
+        for (int i = 1; i < resultTabs.getTabCount(); i++) {
+            ResultTabPanel panel = getResultTabAt(i);
+            if (panel != null && panel.kind() == ResultTabKind.FILE_LIST) {
+                String title = resultTabs.getTitleAt(i);
+                if (!title.equals(excludeTitle)) {
+                    model.addElement(title);
+                }
+            }
+        }
+        targetTabCombo.setModel(model);
+        if (model.getIndexOf(previous) >= 0) {
+            targetTabCombo.setSelectedItem(previous);
+        } else {
+            targetTabCombo.setSelectedItem(FILE_LIST_NEW_TAB);
+        }
+    }
+
+    private void onResultTabSelectionChanged() {
+        ResultTabPanel selected = getSelectedResultTab();
+        boolean grepTabSelected = selected != null && selected.kind() == ResultTabKind.GREP_RESULT;
+        boolean fileListTabSelected = selected != null && selected.kind() == ResultTabKind.FILE_LIST;
+        boolean fileListControlsEnabled = grepTabSelected || fileListTabSelected;
+        addResultTabBtn.setEnabled(fileListControlsEnabled);
+        targetTabCombo.setEnabled(fileListControlsEnabled);
+        if (fileListTabSelected) {
+            addResultTabBtn.setText("マージ");
+        } else {
+            addResultTabBtn.setText("ファイルリスト追加");
+        }
+        updateTargetTabCombo();
+        boolean grepEnabled = !grepTabSelected;
+        grepField.setEnabled(grepEnabled);
+        grepPathField.setEnabled(grepEnabled);
+        grepFileNameField.setEnabled(grepEnabled);
+        grepExtensionField.setEnabled(grepEnabled);
+        grepRegexCheck.setEnabled(grepEnabled);
+        grepBtn.setEnabled(grepEnabled);
+        grepRecursiveCheck.setEnabled(grepEnabled && getActiveTabGrepPaths().isEmpty());
+        if (selected != null) {
+            statusLabel.setText(selected.statusText());
+        } else if (!loading) {
+            updateStatusBar(null, "フォルダ一覧");
+        }
+    }
+
+    private String allocateGrepResultTitle() {
+        return GREP_TAB_PREFIX + (nextGrepResultNumber++);
+    }
+
+    private String allocateFileListTitle() {
+        return FILE_LIST_TAB_PREFIX + (nextFileListNumber++);
+    }
+
+    private void installResultTabContextMenu() {
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem renameItem = new JMenuItem("名前の変更");
+        renameItem.addActionListener(e -> {
+            int index = resultTabs.getSelectedIndex();
+            if (index > 0) {
+                renameResultTabAt(index);
+            }
+        });
+        JMenuItem closeItem = new JMenuItem("タブを閉じる");
+        closeItem.addActionListener(e -> {
+            int index = resultTabs.getSelectedIndex();
+            if (index > 0) {
+                closeResultTabAt(index);
+            }
+        });
+        popup.add(renameItem);
+        popup.add(closeItem);
+
+        resultTabs.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                showPopup(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                showPopup(e);
+            }
+
+            private void showPopup(MouseEvent e) {
+                if (!e.isPopupTrigger()) {
+                    return;
+                }
+                int index = resultTabs.indexAtLocation(e.getX(), e.getY());
+                if (index <= 0) {
+                    return;
+                }
+                resultTabs.setSelectedIndex(index);
+                popup.show(resultTabs, e.getX(), e.getY());
+            }
+        });
+    }
+
+    private void renameResultTabAt(int index) {
+        if (index <= 0 || index >= resultTabs.getTabCount()) {
+            return;
+        }
+        String current = resultTabs.getTitleAt(index);
+        String newTitle = JOptionPane.showInputDialog(this, "タブ名:", current);
+        if (newTitle == null) {
+            return;
+        }
+        newTitle = newTitle.trim();
+        if (newTitle.isEmpty()) {
+            statusLabel.setText("タブ名を入力してください");
+            return;
+        }
+        if ("エクスプローラ".equals(newTitle)) {
+            statusLabel.setText("このタブ名は使用できません");
+            return;
+        }
+        for (int i = 0; i < resultTabs.getTabCount(); i++) {
+            if (i != index && newTitle.equals(resultTabs.getTitleAt(i))) {
+                statusLabel.setText("同じタブ名が既に存在します");
+                return;
+            }
+        }
+        resultTabs.setTitleAt(index, newTitle);
+        updateTargetTabCombo();
+    }
+
+    private int findTabIndexByTitle(String title) {
+        for (int i = 1; i < resultTabs.getTabCount(); i++) {
+            if (title.equals(resultTabs.getTitleAt(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private ResultTabPanel getResultTabAt(int index) {
+        Component component = resultTabs.getComponentAt(index);
+        return component instanceof ResultTabPanel panel ? panel : null;
+    }
+
+    private ResultTabPanel getSelectedGrepResultTab() {
+        ResultTabPanel panel = getSelectedResultTab();
+        return panel != null && panel.kind() == ResultTabKind.GREP_RESULT ? panel : null;
+    }
+
+    private ResultTabPanel getSelectedFileListTab() {
+        ResultTabPanel panel = getSelectedResultTab();
+        return panel != null && panel.kind() == ResultTabKind.FILE_LIST ? panel : null;
+    }
+
+    private List<Path> getActiveTabGrepPaths() {
+        ResultTabPanel selected = getSelectedResultTab();
+        if (selected == null) {
+            return List.of();
+        }
+        return selected.scopePaths();
+    }
+
+    private static List<Path> uniquePathsFromGrepMatches(List<GrepMatch> matches) {
+        Map<Path, Path> unique = new LinkedHashMap<>();
+        for (GrepMatch match : matches) {
+            Path normalized = match.path().toAbsolutePath().normalize();
+            unique.putIfAbsent(normalized, normalized);
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private static List<FileEntry> mergeFileEntries(List<FileEntry> existing, List<FileEntry> incoming) {
+        Map<Path, FileEntry> merged = new LinkedHashMap<>();
+        for (FileEntry entry : existing) {
+            merged.put(entry.path().toAbsolutePath().normalize(), entry);
+        }
+        for (FileEntry entry : incoming) {
+            Path key = entry.path().toAbsolutePath().normalize();
+            FileEntry previous = merged.get(key);
+            merged.put(key, previous != null ? mergeFileEntryMetadata(previous, entry) : entry);
+        }
+        return new ArrayList<>(merged.values());
+    }
+
+    private static FileEntry mergeFileEntryMetadata(FileEntry existing, FileEntry incoming) {
+        return new FileEntry(
+                incoming.name(),
+                incoming.path(),
+                incoming.directory(),
+                incoming.size() != null ? incoming.size() : existing.size(),
+                incoming.modified() != null ? incoming.modified() : existing.modified()
+        );
+    }
+
+    private static List<GrepMatch> mergeGrepMatches(List<GrepMatch> existing, List<GrepMatch> incoming) {
+        Map<String, GrepMatch> merged = new LinkedHashMap<>();
+        for (GrepMatch match : existing) {
+            merged.put(grepMatchKey(match), match);
+        }
+        for (GrepMatch match : incoming) {
+            merged.put(grepMatchKey(match), match);
+        }
+        return new ArrayList<>(merged.values());
+    }
+
+    private static String grepMatchKey(GrepMatch match) {
+        return match.path().toAbsolutePath().normalize() + ":" + match.lineNumber() + ":" + match.line();
+    }
+
+    private void closeResultTabAt(int index) {
+        if (index <= 0 || index >= resultTabs.getTabCount()) {
+            return;
+        }
+        resultTabs.removeTabAt(index);
+        updateTargetTabCombo();
+        onResultTabSelectionChanged();
+    }
+
+    private ResultTabPanel getSelectedResultTab() {
+        Component selected = resultTabs.getSelectedComponent();
+        return selected instanceof ResultTabPanel panel ? panel : null;
+    }
+
+    private void runGrep() {
+        if (currentPath == null || loading) {
+            return;
+        }
+        ResultTabPanel activeTab = getSelectedResultTab();
+        if (activeTab != null && activeTab.kind() == ResultTabKind.GREP_RESULT) {
+            return;
+        }
+        String pattern = grepField.getText().trim();
+        if (pattern.isEmpty()) {
+            return;
+        }
+
+        cancelActiveWorker();
+        searchCancel.set(false);
+
+        List<Path> explicitPaths = getActiveTabGrepPaths();
+        if (activeTab != null && explicitPaths.isEmpty()) {
+            statusLabel.setText("Grep 対象のファイルがありません");
+            return;
+        }
+
+        commitGrepFieldHistory();
+
+        final GrepOptions options;
+        try {
+            options = buildGrepOptions();
+        } catch (IOException ex) {
+            showError(formatError(ex));
+            return;
+        }
+
+        loading = true;
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        statusLabel.setText("Grep 実行中… \"" + pattern + "\"");
+
+        boolean regex = grepRegexCheck.isSelected();
+        boolean recursive = grepRecursiveCheck.isSelected();
+
+        SwingWorker<GrepResult, Void> worker = new SwingWorker<>() {
+            @Override
+            protected GrepResult doInBackground() throws Exception {
+                if (!explicitPaths.isEmpty()) {
+                    return fs.grepPaths(explicitPaths, options, pattern, regex, false, searchCancel);
+                }
+                return fs.grepText(options, pattern, regex, false, recursive, searchCancel);
+            }
+
+            @Override
+            protected void done() {
+                finishActiveWorker(this, result -> applyGrepResult(result), cause -> {
+                    if (cause instanceof java.util.regex.PatternSyntaxException) {
+                        showError("正規表現が無効です: " + cause.getMessage());
+                    } else {
+                        showError(formatError(cause));
+                    }
+                });
+            }
+        };
+        activeWorker = worker;
+        worker.execute();
+    }
+
+    private void applyGrepResult(GrepResult result) {
+        ResultTabPanel panel = new ResultTabPanel(ResultTabKind.GREP_RESULT);
+        panel.setGrepMatches(result.matches(), result.root(), false);
+        resultTabs.addTab(allocateGrepResultTitle(), panel);
+        resultTabs.setSelectedComponent(panel);
+        String mode = "Grep: " + result.matches().size() + " 件 / " + result.filesScanned() + " ファイル";
+        statusLabel.setText(panel.statusText() + "  |  " + result.elapsedMs() + " ms  |  " + mode);
+        updateTargetTabCombo();
+        onResultTabSelectionChanged();
+    }
+
+    private GrepOptions buildGrepOptions() throws IOException {
+        Path searchRoot;
+        List<Path> fileListPaths = getActiveTabGrepPaths();
+        if (!fileListPaths.isEmpty()) {
+            searchRoot = fileListPaths.stream()
+                    .findFirst()
+                    .map(Path::getParent)
+                    .orElse(currentPath);
+        } else {
+            searchRoot = resolveGrepSearchRoot();
+        }
+        if (searchRoot == null) {
+            searchRoot = Paths.get(System.getProperty("user.home"));
+        }
+        String fileNamePattern = grepFileNameField.getText().trim();
+        List<String> extensions = parseExtensionList(grepExtensionField.getText());
+        return new GrepOptions(searchRoot, fileNamePattern, extensions);
+    }
+
+    private Path resolveGrepSearchRoot() throws IOException {
+        String pathText = grepPathField.getText().trim();
+        if (pathText.isEmpty()) {
+            if (currentPath == null) {
+                throw new IOException("現在のフォルダが未設定です");
+            }
+            return currentPath;
+        }
+        Path input = Paths.get(pathText);
+        if (input.isAbsolute()) {
+            return PathUtil.resolveForAccess(input);
+        }
+        if (currentPath == null) {
+            return PathUtil.resolveForAccess(input);
+        }
+        return PathUtil.resolveForAccess(currentPath.resolve(input).normalize());
+    }
+
+    private static List<String> parseExtensionList(String text) {
+        if (text.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(text.split("[,;\\s]+"))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+    }
+
+    private void openGrepMatch(GrepMatch match) {
+        openFile(match.path(), true);
+    }
+
+    private void openFile(Path path, boolean useLocalCopyForUnc) {
+        try {
+            if (useLocalCopyForUnc && PathUtil.isUnc(path)) {
+                statusLabel.setText("ローカルにコピー中… " + path.getFileName());
+                Path localCopy = LocalFileOpener.copyToLocalTemp(path);
+                Desktop.getDesktop().open(localCopy.toFile());
+                statusLabel.setText("開きました: " + PathUtil.toDisplay(localCopy));
+                return;
+            }
+            Desktop.getDesktop().open(PathUtil.resolveForAccess(path).toFile());
+        } catch (IOException ex) {
+            showError(formatError(ex));
+        }
+    }
+
+    private void openFileOnServer(Path path) {
+        openFile(path, false);
+    }
+
+    private void updateStatusBar(Long elapsedMs, String mode) {
+        int visible = table.getRowCount();
+        String countText = visible == totalEntryCount
+                ? totalEntryCount + " 項目"
+                : visible + " / " + totalEntryCount + " 項目";
+        String timeText = elapsedMs != null ? "  |  " + elapsedMs + " ms" : "";
+        statusLabel.setText(countText + timeText + "  |  " + mode);
+    }
+
+    private void cancelActiveWorker() {
+        searchCancel.set(true);
+        if (activeWorker != null && !activeWorker.isDone()) {
+            activeWorker.cancel(true);
+        }
+    }
+
+    private <T> void finishActiveWorker(SwingWorker<T, Void> worker, Consumer<T> onSuccess) {
+        finishActiveWorker(worker, onSuccess, cause -> showError(formatError(cause)));
+    }
+
+    private <T> void finishActiveWorker(
+            SwingWorker<T, Void> worker,
+            Consumer<T> onSuccess,
+            Consumer<Throwable> onError
+    ) {
+        if (activeWorker != worker) {
+            return;
+        }
+        loading = false;
+        activeWorker = null;
+        setCursor(Cursor.getDefaultCursor());
+        try {
+            if (worker.isCancelled()) {
+                return;
+            }
+            onSuccess.accept(worker.get());
+        } catch (CancellationException ignored) {
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException ex) {
+            if (searchCancel.get()) {
+                return;
+            }
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            if (cause instanceof CancellationException) {
+                return;
+            }
+            onError.accept(cause);
+        } catch (Exception ex) {
+            if (searchCancel.get()) {
+                return;
+            }
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            if (cause instanceof CancellationException) {
+                return;
+            }
+            onError.accept(cause);
+        }
+    }
+
+    private void openEntry(FileEntry entry) {
+        try {
+            Path target = PathUtil.resolveForAccess(entry.path());
+            if (entry.directory()) {
+                clearNavigationState();
+                loadDirectory(target, true, false);
+                return;
+            }
+            openFile(entry.path(), true);
+        } catch (IOException ex) {
+            showError(formatError(ex));
+        }
+    }
+
+    private static String formatError(Throwable cause) {
+        if (cause instanceof java.nio.file.AccessDeniedException) {
+            return "アクセスが拒否されました:\n" + cause.getMessage();
+        }
+        if (cause instanceof java.nio.file.NoSuchFileException) {
+            return "パスが見つかりません:\n" + cause.getMessage();
+        }
+        if (cause instanceof java.nio.file.NotDirectoryException) {
+            return "フォルダではありません:\n" + cause.getMessage();
+        }
+        String message = cause.getMessage();
+        return message != null ? message : cause.toString();
+    }
+
+    private void goUp() {
+        if (currentPath == null) {
+            return;
+        }
+        Path parent = fs.getParent(currentPath);
+        if (!parent.equals(currentPath)) {
+            clearNavigationState();
+            loadDirectory(parent, true, false);
+        }
+    }
+
+    private void goBack() {
+        if (historyIndex > 0) {
+            historyIndex--;
+            clearNavigationState();
+            loadDirectory(history.get(historyIndex), false, false);
+        }
+    }
+
+    private void goForward() {
+        if (historyIndex < history.size() - 1) {
+            historyIndex++;
+            clearNavigationState();
+            loadDirectory(history.get(historyIndex), false, false);
+        }
+    }
+
+    private void updateNavButtons() {
+        backBtn.setEnabled(historyIndex > 0);
+        forwardBtn.setEnabled(historyIndex >= 0 && historyIndex < history.size() - 1);
+    }
+
+    private void showError(String message) {
+        statusLabel.setText(message);
+        JOptionPane.showMessageDialog(this, message, "エラー", JOptionPane.ERROR_MESSAGE);
+    }
+
+    private enum ResultTabKind {
+        GREP_RESULT,
+        FILE_LIST
+    }
+
+    private final class ResultTabPanel extends JPanel {
+
+        private final ResultTabKind kind;
+        private final FileTableModel fileModel = new FileTableModel();
+        private final GrepResultTableModel grepModel = new GrepResultTableModel();
+        private final JTable resultTable;
+        private Path displayBase;
+        private List<Path> scopePaths = List.of();
+
+        ResultTabPanel(ResultTabKind kind) {
+            super(new BorderLayout());
+            this.kind = kind;
+            if (kind == ResultTabKind.GREP_RESULT) {
+                resultTable = new JTable(grepModel);
+                configureResultGrepTable(resultTable);
+            } else {
+                fileModel.setShowFullPath(true);
+                resultTable = new JTable(fileModel);
+                configureResultFileTable(resultTable, fileModel);
+            }
+            resultTable.setRowHeight(28);
+            resultTable.setShowGrid(false);
+            resultTable.setIntercellSpacing(new Dimension(0, 0));
+            resultTable.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+            resultTable.getTableHeader().setReorderingAllowed(false);
+            installResultTableActions();
+            installResultTableKeyBindings();
+            add(new JScrollPane(resultTable), BorderLayout.CENTER);
+        }
+
+        ResultTabKind kind() {
+            return kind;
+        }
+
+        List<FileEntry> fileEntries() {
+            return kind == ResultTabKind.FILE_LIST ? List.copyOf(fileModel.getEntries()) : List.of();
+        }
+
+        void setFileEntries(List<FileEntry> entries, Path displayBase, boolean merge) {
+            if (kind != ResultTabKind.FILE_LIST) {
+                return;
+            }
+            this.displayBase = displayBase;
+            List<FileEntry> combined = merge
+                    ? mergeFileEntries(fileModel.getEntries(), entries)
+                    : List.copyOf(entries);
+            fileModel.setContent(combined, null);
+            showFileTable();
+            refreshScopePaths();
+        }
+
+        void setGrepMatches(List<GrepMatch> matches, Path displayBase, boolean merge) {
+            if (kind != ResultTabKind.GREP_RESULT) {
+                return;
+            }
+            this.displayBase = displayBase;
+            List<GrepMatch> combined = merge
+                    ? mergeGrepMatches(grepModel.getMatches(), matches)
+                    : List.copyOf(matches);
+            grepModel.setMatches(combined, displayBase);
+            showGrepTable();
+            refreshScopePaths();
+        }
+
+        List<Path> scopePaths() {
+            return scopePaths;
+        }
+
+        String statusText() {
+            String kindLabel = kind == ResultTabKind.GREP_RESULT ? "Grep 結果" : "ファイルリスト";
+            int rowCount = kind == ResultTabKind.GREP_RESULT
+                    ? grepModel.getRowCount()
+                    : fileModel.getRowCount();
+            return rowCount + " 件  |  " + scopePaths.size() + " ファイル  |  " + kindLabel;
+        }
+
+        private void showFileTable() {
+            resultTable.setModel(fileModel);
+            resultTable.setRowSorter(new TableRowSorter<>(fileModel));
+            configureResultFileTable(resultTable, fileModel);
+            resultTable.revalidate();
+            resultTable.repaint();
+        }
+
+        private void showGrepTable() {
+            resultTable.setModel(grepModel);
+            resultTable.setRowSorter(new TableRowSorter<>(grepModel));
+            configureResultGrepTable(resultTable);
+            resultTable.revalidate();
+            resultTable.repaint();
+        }
+
+        private void refreshScopePaths() {
+            if (kind == ResultTabKind.GREP_RESULT) {
+                scopePaths = uniquePathsFromGrepMatches(grepModel.getMatches());
+            } else {
+                scopePaths = fileModel.getEntries().stream()
+                        .filter(entry -> !entry.directory())
+                        .map(FileEntry::path)
+                        .map(path -> path.toAbsolutePath().normalize())
+                        .distinct()
+                        .toList();
+            }
+        }
+
+        private void configureResultFileTable(JTable target, FileTableModel model) {
+            target.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
+                @Override
+                public Component getTableCellRendererComponent(
+                        JTable t, Object value, boolean selected, boolean focus, int row, int column) {
+                    Component component = super.getTableCellRendererComponent(
+                            t, value, selected, focus, row, column);
+                    int modelRow = t.convertRowIndexToModel(row);
+                    FileEntry entry = model.getEntry(modelRow);
+                    if (entry == null) {
+                        return component;
+                    }
+                    if (!selected) {
+                        component.setBackground(t.getBackground());
+                        component.setForeground(FileTypeUtil.isTextFile(entry.name())
+                                ? TEXT_FILE_COLOR : BINARY_FILE_COLOR);
+                    }
+                    return component;
+                }
+            });
+            if (target.getColumnCount() < 5) {
+                return;
+            }
+            target.getColumnModel().getColumn(0).setPreferredWidth(480);
+            target.getColumnModel().getColumn(1).setPreferredWidth(160);
+            target.getColumnModel().getColumn(2).setPreferredWidth(80);
+            target.getColumnModel().getColumn(3).setPreferredWidth(100);
+            target.getColumnModel().getColumn(4).setPreferredWidth(160);
+        }
+
+        private void configureResultGrepTable(JTable target) {
+            if (target.getColumnCount() < 4) {
+                return;
+            }
+            target.getColumnModel().getColumn(0).setPreferredWidth(420);
+            target.getColumnModel().getColumn(1).setPreferredWidth(140);
+            target.getColumnModel().getColumn(2).setPreferredWidth(50);
+            target.getColumnModel().getColumn(3).setPreferredWidth(500);
+        }
+
+        private void installResultTableActions() {
+            JPopupMenu popup = new JPopupMenu();
+            JMenuItem openServerFileItem = new JMenuItem("サーバのファイルを開く");
+            openServerFileItem.addActionListener(e -> {
+                Path path = selectedPath();
+                if (path != null) {
+                    openFileOnServer(path);
+                }
+            });
+            JMenuItem copyPath = new JMenuItem("パスのコピー");
+            copyPath.addActionListener(e -> {
+                Path path = selectedPath();
+                if (path != null) {
+                    copyToClipboard(path.toString());
+                }
+            });
+            JMenuItem copyLine = new JMenuItem("行のコピー");
+            copyLine.addActionListener(e -> {
+                GrepMatch match = selectedGrepMatch();
+                if (match != null) {
+                    copyToClipboard(match.line());
+                }
+            });
+            popup.add(openServerFileItem);
+            popup.add(copyPath);
+            popup.add(copyLine);
+
+            resultTable.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (e.getClickCount() == 2) {
+                        openSelectedResult();
+                    }
+                }
+
+                @Override
+                public void mousePressed(MouseEvent e) {
+                    showPopup(e);
+                }
+
+                @Override
+                public void mouseReleased(MouseEvent e) {
+                    showPopup(e);
+                }
+
+                private void showPopup(MouseEvent e) {
+                    if (!e.isPopupTrigger()) {
+                        return;
+                    }
+                    int row = resultTable.rowAtPoint(e.getPoint());
+                    if (row >= 0) {
+                        resultTable.setRowSelectionInterval(row, row);
+                        copyLine.setVisible(kind == ResultTabKind.GREP_RESULT);
+                        Path path = selectedPath();
+                        boolean uncFile = path != null && PathUtil.isUnc(path);
+                        if (kind == ResultTabKind.FILE_LIST) {
+                            int modelRow = resultTable.convertRowIndexToModel(row);
+                            FileEntry entry = fileModel.getEntry(modelRow);
+                            uncFile = entry != null && !entry.directory() && PathUtil.isUnc(entry.path());
+                        }
+                        openServerFileItem.setVisible(uncFile);
+                        popup.show(resultTable, e.getX(), e.getY());
+                    }
+                }
+            });
+        }
+
+        private void installResultTableKeyBindings() {
+            int menuShortcut = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
+            InputMap inputMap = resultTable.getInputMap(JComponent.WHEN_FOCUSED);
+            ActionMap actionMap = resultTable.getActionMap();
+
+            inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_A, menuShortcut), "selectAllRows");
+            actionMap.put("selectAllRows", new AbstractAction() {
+                @Override
+                public void actionPerformed(java.awt.event.ActionEvent e) {
+                    selectAllResultRows();
+                }
+            });
+
+            inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_C, menuShortcut), "copyResultRows");
+            actionMap.put("copyResultRows", new AbstractAction() {
+                @Override
+                public void actionPerformed(java.awt.event.ActionEvent e) {
+                    copySelectedResultRows();
+                }
+            });
+        }
+
+        private void selectAllResultRows() {
+            int rowCount = resultTable.getRowCount();
+            if (rowCount > 0) {
+                resultTable.setRowSelectionInterval(0, rowCount - 1);
+            }
+        }
+
+        private void copySelectedResultRows() {
+            int[] viewRows = resultTable.getSelectedRows();
+            if (viewRows.length == 0) {
+                return;
+            }
+            if (kind == ResultTabKind.FILE_LIST) {
+                copyFileListPaths(viewRows);
+            } else {
+                copyGrepResultsTsv(viewRows);
+            }
+        }
+
+        private void copyFileListPaths(int[] viewRows) {
+            StringBuilder text = new StringBuilder();
+            for (int viewRow : viewRows) {
+                FileEntry entry = fileModel.getEntry(resultTable.convertRowIndexToModel(viewRow));
+                if (entry == null) {
+                    continue;
+                }
+                if (text.length() > 0) {
+                    text.append('\n');
+                }
+                text.append(PathUtil.toDisplay(entry.path()));
+            }
+            if (text.isEmpty()) {
+                return;
+            }
+            copyBulkToClipboard(text.toString(), viewRows.length + " 件のパス");
+        }
+
+        private void copyGrepResultsTsv(int[] viewRows) {
+            StringBuilder text = new StringBuilder();
+            for (int col = 0; col < grepModel.getColumnCount(); col++) {
+                if (col > 0) {
+                    text.append('\t');
+                }
+                text.append(tsvCell(grepModel.getColumnName(col)));
+            }
+            for (int viewRow : viewRows) {
+                text.append('\n');
+                int modelRow = resultTable.convertRowIndexToModel(viewRow);
+                for (int col = 0; col < grepModel.getColumnCount(); col++) {
+                    if (col > 0) {
+                        text.append('\t');
+                    }
+                    Object value = grepModel.getValueAt(modelRow, col);
+                    text.append(tsvCell(value != null ? value.toString() : ""));
+                }
+            }
+            copyBulkToClipboard(text.toString(), viewRows.length + " 行 (TSV)");
+        }
+
+        private static String tsvCell(String value) {
+            if (value.indexOf('\t') >= 0 || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+                return "\"" + value.replace("\"", "\"\"") + "\"";
+            }
+            return value;
+        }
+
+        private void copyBulkToClipboard(String text, String summary) {
+            StringSelection selection = new StringSelection(text);
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, selection);
+            statusLabel.setText("コピーしました: " + summary);
+        }
+
+        private GrepMatch selectedGrepMatch() {
+            if (kind != ResultTabKind.GREP_RESULT) {
+                return null;
+            }
+            int viewRow = resultTable.getSelectedRow();
+            if (viewRow < 0) {
+                return null;
+            }
+            return grepModel.getMatch(resultTable.convertRowIndexToModel(viewRow));
+        }
+
+        private Path selectedPath() {
+            int viewRow = resultTable.getSelectedRow();
+            if (viewRow < 0) {
+                return null;
+            }
+            int modelRow = resultTable.convertRowIndexToModel(viewRow);
+            if (kind == ResultTabKind.GREP_RESULT) {
+                GrepMatch match = grepModel.getMatch(modelRow);
+                return match != null ? match.path() : null;
+            }
+            FileEntry entry = fileModel.getEntry(modelRow);
+            return entry != null ? entry.path() : null;
+        }
+
+        private void openSelectedResult() {
+            int viewRow = resultTable.getSelectedRow();
+            if (viewRow < 0) {
+                return;
+            }
+            int modelRow = resultTable.convertRowIndexToModel(viewRow);
+            if (kind == ResultTabKind.GREP_RESULT) {
+                GrepMatch match = grepModel.getMatch(modelRow);
+                if (match != null) {
+                    openGrepMatch(match);
+                }
+            } else {
+                FileEntry entry = fileModel.getEntry(modelRow);
+                if (entry != null) {
+                    openEntry(entry);
+                }
+            }
+        }
+    }
+
+    private static final class FileTableModel extends AbstractTableModel {
+
+        private static final String[] COLS = {"名前", "種類", "サイズ", "更新日時"};
+        private static final String[] FULL_PATH_COLS = {"パス", "ファイル名", "種類", "サイズ", "更新日時"};
+        private List<FileEntry> entries = List.of();
+        private Path displayBase;
+        private boolean showFullPath;
+
+        void setShowFullPath(boolean showFullPath) {
+            this.showFullPath = showFullPath;
+            fireTableStructureChanged();
+        }
+
+        void setEntries(List<FileEntry> entries) {
+            this.entries = entries;
+            fireTableDataChanged();
+        }
+
+        void setContent(List<FileEntry> entries, Path displayBase) {
+            this.entries = entries;
+            this.displayBase = displayBase;
+            fireTableDataChanged();
+        }
+
+        void setDisplayBase(Path displayBase) {
+            this.displayBase = displayBase;
+            fireTableDataChanged();
+        }
+
+        FileEntry getEntry(int row) {
+            if (row < 0 || row >= entries.size()) {
+                return null;
+            }
+            return entries.get(row);
+        }
+
+        List<FileEntry> getEntries() {
+            return entries;
+        }
+
+        Path getDisplayBase() {
+            return displayBase;
+        }
+
+        @Override
+        public int getColumnCount() {
+            return showFullPath ? FULL_PATH_COLS.length : COLS.length;
+        }
+
+        @Override
+        public int getRowCount() {
+            return entries.size();
+        }
+
+        @Override
+        public String getColumnName(int column) {
+            return (showFullPath ? FULL_PATH_COLS : COLS)[column];
+        }
+
+        @Override
+        public Object getValueAt(int row, int column) {
+            if (row < 0 || row >= entries.size()) {
+                return "";
+            }
+            FileEntry e = entries.get(row);
+            if (showFullPath) {
+                return switch (column) {
+                    case 0 -> formatPath(e);
+                    case 1 -> e.name();
+                    case 2 -> FileTypeUtil.typeDisplay(e);
+                    case 3 -> e.directory() ? "—" : formatSize(e.size());
+                    case 4 -> e.modified() != null ? DATE_FMT.format(e.modified()) : "—";
+                    default -> "";
+                };
+            }
+            return switch (column) {
+                case 0 -> formatName(e);
+                case 1 -> FileTypeUtil.typeDisplay(e);
+                case 2 -> e.directory() ? "—" : formatSize(e.size());
+                case 3 -> e.modified() != null ? DATE_FMT.format(e.modified()) : "—";
+                default -> "";
+            };
+        }
+
+        @Override
+        public Class<?> getColumnClass(int columnIndex) {
+            return String.class;
+        }
+
+        private String formatPath(FileEntry e) {
+            return (e.directory() ? "📁 " : "📄 ") + PathUtil.toDisplay(e.path());
+        }
+
+        private String formatName(FileEntry e) {
+            String label = displayBase != null
+                    ? displayBase.relativize(e.path()).toString()
+                    : e.name();
+            return (e.directory() ? "📁 " : "📄 ") + label;
+        }
+
+        private static String formatSize(Long bytes) {
+            if (bytes == null) {
+                return "—";
+            }
+            if (bytes < 1024) {
+                return bytes + " B";
+            }
+            if (bytes < 1024 * 1024) {
+                return String.format("%.1f KB", bytes / 1024.0);
+            }
+            if (bytes < 1024L * 1024 * 1024) {
+                return String.format("%.1f MB", bytes / (1024.0 * 1024));
+            }
+            return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+        }
+    }
+}
