@@ -14,9 +14,15 @@ import java.util.List;
 public class HistoryTextField extends JComboBox<String> {
 
     private final String historyKey;
+    private final boolean restoreLastValue;
 
     public HistoryTextField(String historyKey) {
+        this(historyKey, false);
+    }
+
+    public HistoryTextField(String historyKey, boolean restoreLastValue) {
         this.historyKey = historyKey;
+        this.restoreLastValue = restoreLastValue;
         setEditable(true);
         setPrototypeDisplayValue("MMMMMMMMMMMM");
         loadFromStore();
@@ -88,8 +94,13 @@ public class HistoryTextField extends JComboBox<String> {
         }
         setModel(model);
         if (model.getSize() > 0) {
-            setSelectedIndex(-1);
-            setText("");
+            if (restoreLastValue) {
+                setSelectedIndex(0);
+                setText(model.getElementAt(0));
+            } else {
+                setSelectedIndex(-1);
+                setText("");
+            }
         }
     }
 }

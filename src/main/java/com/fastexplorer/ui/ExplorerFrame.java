@@ -70,7 +70,7 @@ public class ExplorerFrame extends JFrame {
     private final HistoryTextField grepPathField = new HistoryTextField("grep.path");
     private final HistoryTextField grepFileNameField = new HistoryTextField("grep.file");
     private final HistoryTextField grepExtensionField = new HistoryTextField("grep.extension");
-    private final HistoryTextField grepEditorField = new HistoryTextField("grep.editor");
+    private final HistoryTextField grepEditorField = new HistoryTextField("grep.editor", true);
     private final JCheckBox grepRegexCheck = new JCheckBox("正規表現", false);
     private final JCheckBox grepRecursiveCheck = new JCheckBox("サブフォルダ", true);
     private final JSpinner grepContextSpinner = new JSpinner(new SpinnerNumberModel(0, 0, 20, 1));
@@ -883,6 +883,7 @@ public class ExplorerFrame extends JFrame {
     }
 
     private void persistInputHistory() {
+        grepEditorField.commitHistory();
         for (HistoryTextField field : historyFields) {
             field.persistHistory();
         }
