@@ -1,5 +1,6 @@
 package com.fastexplorer.ui;
 
+import com.fastexplorer.config.BookmarkStore;
 import com.fastexplorer.config.PathHistoryStore;
 import com.fastexplorer.fs.CachedFileSystemService;
 import com.fastexplorer.model.FileEntry;
@@ -75,11 +76,15 @@ public class ExplorerFrame extends JFrame {
     private final JCheckBox grepRecursiveCheck = new JCheckBox("サブフォルダ", true);
     private final JSpinner grepContextSpinner = new JSpinner(new SpinnerNumberModel(0, 0, 20, 1));
     private final JButton grepBtn = new JButton("Grep");
+    private final JButton saveGrepFavoriteBtn = new JButton("★");
     private final JComboBox<String> pathCombo = new JComboBox<>();
     private final HistoryTextField searchPathField = new HistoryTextField("search.path");
     private final HistoryTextField searchFileNameField = new HistoryTextField("search.file");
     private final HistoryTextField searchExtensionField = new HistoryTextField("search.extension");
+    private final JButton searchBtn = new JButton("検索");
+    private final JButton saveSearchFavoriteBtn = new JButton("★");
     private final JLabel statusLabel = new JLabel(" ");
+    private final JProgressBar taskProgressBar = new JProgressBar();
     private final JCheckBox subfolderSearchCheck = new JCheckBox("サブフォルダも検索", true);
     private final JButton backBtn = new JButton("←");
     private final JButton forwardBtn = new JButton("→");
@@ -95,6 +100,13 @@ public class ExplorerFrame extends JFrame {
     private static final String FILE_LIST_NEW_TAB = "新規タブ";
     private static final String SCRIPT_TAB_TITLE = "スクリプト";
 
+    private enum ActiveTask {
+        NONE,
+        DIRECTORY,
+        SEARCH,
+        GREP
+    }
+
     private final JComboBox<String> targetTabCombo = new JComboBox<>();
     private final JButton addResultTabBtn = new JButton("ファイルリスト追加");
     private final HistoryTextField copyBaseField = new HistoryTextField("filelist.copy.base");
@@ -107,10 +119,24 @@ public class ExplorerFrame extends JFrame {
     private int historyIndex = -1;
     private Path currentPath;
     private boolean loading;
+    private ActiveTask activeTask = ActiveTask.NONE;
+    private String taskStatusText = "";
     private int totalEntryCount;
     private SwingWorker<?, ?> activeWorker;
     private final AtomicBoolean searchCancel = new AtomicBoolean();
     private boolean updatingPathCombo;
+
+    private final FavoritesPanel favoritesPanel = new FavoritesPanel(
+            this::navigateToPath,
+            this::persistBookmarks,
+            this::getCurrentPathText,
+            this::getCurrentSearchPreset,
+            this::applySearchPreset,
+            this::runSubfolderSearch,
+            this::getCurrentGrepPreset,
+            this::applyGrepPreset,
+            this::runGrep
+    );
 
     private final List<HistoryTextField> historyFields = List.of(
             grepField,
@@ -135,6 +161,7 @@ public class ExplorerFrame extends JFrame {
         initTable();
         initToolbar();
         initLayout();
+        favoritesPanel.loadBookmarks(BookmarkStore.load());
         installWindowListeners();
         restorePathHistoryAndNavigate();
     }
@@ -145,6 +172,7 @@ public class ExplorerFrame extends JFrame {
             public void windowClosing(WindowEvent e) {
                 persistPathHistory();
                 persistInputHistory();
+                persistBookmarks();
                 fs.shutdown();
             }
         });
@@ -433,9 +461,15 @@ public class ExplorerFrame extends JFrame {
 
         JPanel pathPanel = new JPanel(new BorderLayout(6, 0));
         pathPanel.add(pathCombo, BorderLayout.CENTER);
+        JPanel pathActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        JButton addFavoriteBtn = new JButton("★");
+        addFavoriteBtn.setToolTipText("現在のパスをお気に入りに追加");
+        addFavoriteBtn.addActionListener(e -> addCurrentPathToFavorites());
         JButton goBtn = new JButton("移動");
         goBtn.addActionListener(e -> navigateToPath(getPathInput()));
-        pathPanel.add(goBtn, BorderLayout.EAST);
+        pathActions.add(addFavoriteBtn);
+        pathActions.add(goBtn);
+        pathPanel.add(pathActions, BorderLayout.EAST);
 
         toolbar.add(nav, BorderLayout.WEST);
         toolbar.add(pathPanel, BorderLayout.CENTER);
@@ -450,8 +484,10 @@ public class ExplorerFrame extends JFrame {
         );
         JPanel searchActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
         searchActions.add(subfolderSearchCheck);
-        JButton searchBtn = new JButton("検索");
+        saveSearchFavoriteBtn.setToolTipText("現在の検索条件をお気に入りに追加");
+        saveSearchFavoriteBtn.addActionListener(e -> favoritesPanel.addCurrentSearch());
         searchBtn.addActionListener(e -> runSubfolderSearch());
+        searchActions.add(saveSearchFavoriteBtn);
         searchActions.add(searchBtn);
 
         JPanel searchRow = new JPanel(new BorderLayout(8, 0));
@@ -476,6 +512,9 @@ public class ExplorerFrame extends JFrame {
         grepActions.add(grepContextSpinner);
         grepActions.add(new JLabel("行"));
         grepBtn.addActionListener(e -> runGrep());
+        saveGrepFavoriteBtn.setToolTipText("現在の Grep 条件をお気に入りに追加");
+        saveGrepFavoriteBtn.addActionListener(e -> favoritesPanel.addCurrentGrep());
+        grepActions.add(saveGrepFavoriteBtn);
         grepActions.add(grepBtn);
         grepRow1.add(grepActions, BorderLayout.EAST);
 
@@ -509,6 +548,13 @@ public class ExplorerFrame extends JFrame {
 
         statusLabel.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
         statusLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+        taskProgressBar.setIndeterminate(true);
+        taskProgressBar.setVisible(false);
+        taskProgressBar.setPreferredSize(new Dimension(120, taskProgressBar.getPreferredSize().height));
+
+        JPanel statusPanel = new JPanel(new BorderLayout(8, 0));
+        statusPanel.add(statusLabel, BorderLayout.CENTER);
+        statusPanel.add(taskProgressBar, BorderLayout.EAST);
 
         getContentPane().setLayout(new BorderLayout());
         getContentPane().add(north, BorderLayout.NORTH);
@@ -517,8 +563,144 @@ public class ExplorerFrame extends JFrame {
         installResultTabContextMenu();
         updateTargetTabCombo();
         onResultTabSelectionChanged();
-        getContentPane().add(resultTabs, BorderLayout.CENTER);
-        getContentPane().add(statusLabel, BorderLayout.SOUTH);
+        JSplitPane centerSplit = new JSplitPane(
+                JSplitPane.HORIZONTAL_SPLIT,
+                favoritesPanel,
+                resultTabs
+        );
+        centerSplit.setDividerLocation(220);
+        centerSplit.setOneTouchExpandable(true);
+        centerSplit.setResizeWeight(0);
+        centerSplit.setContinuousLayout(true);
+        getContentPane().add(centerSplit, BorderLayout.CENTER);
+        getContentPane().add(statusPanel, BorderLayout.SOUTH);
+    }
+
+    private void beginTask(ActiveTask task, String statusText) {
+        activeTask = task;
+        loading = true;
+        taskStatusText = statusText;
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        statusLabel.setText(statusText);
+        taskProgressBar.setVisible(task == ActiveTask.SEARCH || task == ActiveTask.GREP);
+        updateBusyControls();
+    }
+
+    private void updateTaskStatus(String statusText) {
+        taskStatusText = statusText;
+        if (loading) {
+            statusLabel.setText(statusText);
+        }
+    }
+
+    private void endTask() {
+        activeTask = ActiveTask.NONE;
+        loading = false;
+        taskStatusText = "";
+        setCursor(Cursor.getDefaultCursor());
+        taskProgressBar.setVisible(false);
+        updateBusyControls();
+    }
+
+    private void updateBusyControls() {
+        boolean busy = loading;
+        boolean searching = activeTask == ActiveTask.SEARCH;
+        boolean grepping = activeTask == ActiveTask.GREP;
+
+        searchBtn.setText(searching ? "検索中…" : "検索");
+        searchBtn.setEnabled(!busy);
+        searchPathField.setEnabled(!busy);
+        searchFileNameField.setEnabled(!busy);
+        searchExtensionField.setEnabled(!busy);
+        subfolderSearchCheck.setEnabled(!busy);
+        saveSearchFavoriteBtn.setEnabled(!busy);
+
+        ResultTabPanel selected = getSelectedResultTab();
+        boolean grepTabSelected = selected != null && selected.kind() == ResultTabKind.GREP_RESULT;
+        boolean fileListTabSelected = selected != null && selected.kind() == ResultTabKind.FILE_LIST;
+        boolean grepControlsEnabled = !busy && !grepTabSelected;
+
+        grepBtn.setText(grepping ? "Grep中…" : "Grep");
+        grepBtn.setEnabled(grepControlsEnabled);
+        grepField.setEnabled(grepControlsEnabled);
+        grepPathField.setEnabled(grepControlsEnabled);
+        grepFileNameField.setEnabled(grepControlsEnabled);
+        grepExtensionField.setEnabled(grepControlsEnabled);
+        grepRegexCheck.setEnabled(grepControlsEnabled);
+        grepRecursiveCheck.setEnabled(grepControlsEnabled && getActiveTabGrepPaths().isEmpty());
+        grepContextSpinner.setEnabled(grepControlsEnabled);
+        saveGrepFavoriteBtn.setEnabled(!busy);
+
+        boolean fileListControlsEnabled = !busy && (grepTabSelected || fileListTabSelected);
+        addResultTabBtn.setEnabled(fileListControlsEnabled);
+        targetTabCombo.setEnabled(fileListControlsEnabled);
+
+        boolean fileListCopyEnabled = fileListTabSelected && !busy;
+        copyBaseField.setEnabled(fileListCopyEnabled);
+        copyDestField.setEnabled(fileListCopyEnabled);
+        generateCopyScriptBtn.setEnabled(fileListCopyEnabled);
+
+        backBtn.setEnabled(!busy && historyIndex > 0);
+        forwardBtn.setEnabled(!busy && historyIndex >= 0 && historyIndex < history.size() - 1);
+        upBtn.setEnabled(!busy && currentPath != null && currentPath.getParent() != null);
+        refreshBtn.setEnabled(!busy && currentPath != null);
+        pathCombo.setEnabled(!busy);
+    }
+
+    private String getCurrentPathText() {
+        if (currentPath == null) {
+            return "";
+        }
+        return PathUtil.toDisplay(currentPath);
+    }
+
+    private void addCurrentPathToFavorites() {
+        String path = getCurrentPathText();
+        if (path.isBlank()) {
+            showError("現在のパスがありません");
+            return;
+        }
+        favoritesPanel.addCurrentPath(path);
+    }
+
+    private void persistBookmarks() {
+        BookmarkStore.save(favoritesPanel.getRootChildren());
+    }
+
+    private BookmarkSearchPreset getCurrentSearchPreset() {
+        return new BookmarkSearchPreset(
+                searchPathField.getText().trim(),
+                searchFileNameField.getText().trim(),
+                searchExtensionField.getText().trim()
+        );
+    }
+
+    private void applySearchPreset(BookmarkSearchPreset preset) {
+        searchPathField.setText(preset.pathPatterns());
+        searchFileNameField.setText(preset.filePatterns());
+        searchExtensionField.setText(preset.extensions());
+    }
+
+    private BookmarkGrepPreset getCurrentGrepPreset() {
+        return new BookmarkGrepPreset(
+                grepField.getText().trim(),
+                grepPathField.getText().trim(),
+                grepFileNameField.getText().trim(),
+                grepExtensionField.getText().trim(),
+                grepRegexCheck.isSelected(),
+                grepRecursiveCheck.isSelected(),
+                ((Number) grepContextSpinner.getValue()).intValue()
+        );
+    }
+
+    private void applyGrepPreset(BookmarkGrepPreset preset) {
+        grepField.setText(preset.pattern());
+        grepPathField.setText(preset.path());
+        grepFileNameField.setText(preset.file());
+        grepExtensionField.setText(preset.extension());
+        grepRegexCheck.setSelected(preset.regex());
+        grepRecursiveCheck.setSelected(preset.recursive());
+        grepContextSpinner.setValue(preset.context());
     }
 
     private JPanel buildSettingsPanel() {
@@ -674,9 +856,7 @@ public class ExplorerFrame extends JFrame {
         final Path normalizedPath = path.toAbsolutePath().normalize();
         cancelActiveWorker();
         tableModel.setDisplayBase(null);
-        loading = true;
-        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-        statusLabel.setText(forceRefresh ? "更新中…" : "読み込み中…");
+        beginTask(ActiveTask.DIRECTORY, forceRefresh ? "更新中…" : "読み込み中…");
 
         boolean includeSize = true;
         final Path requestedPath = normalizedPath;
@@ -759,9 +939,7 @@ public class ExplorerFrame extends JFrame {
         cancelActiveWorker();
         searchCancel.set(false);
 
-        loading = true;
-        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-        statusLabel.setText("検索中… " + formatSearchCriteria(options));
+        beginTask(ActiveTask.SEARCH, "検索中… " + formatSearchCriteria(options));
 
         final ResultTabPanel[] searchTab = new ResultTabPanel[1];
         final SearchOptions searchOptions = options;
@@ -786,6 +964,9 @@ public class ExplorerFrame extends JFrame {
             return;
         }
         List<FileEntry> entries = result.entries();
+        if (activeTask == ActiveTask.SEARCH && loading) {
+            updateTaskStatus("検索中… " + entries.size() + " 件  |  " + formatSearchCriteria(buildSearchOptions()));
+        }
         if (entries.isEmpty()) {
             if (tabHolder[0] == null) {
                 JOptionPane.showMessageDialog(
@@ -1170,41 +1351,31 @@ public class ExplorerFrame extends JFrame {
 
     private void onResultTabSelectionChanged() {
         ResultTabPanel selected = getSelectedResultTab();
-        boolean grepTabSelected = selected != null && selected.kind() == ResultTabKind.GREP_RESULT;
         boolean fileListTabSelected = selected != null && selected.kind() == ResultTabKind.FILE_LIST;
-        boolean fileListControlsEnabled = grepTabSelected || fileListTabSelected;
-        addResultTabBtn.setEnabled(fileListControlsEnabled);
-        targetTabCombo.setEnabled(fileListControlsEnabled);
         if (fileListTabSelected) {
             addResultTabBtn.setText("マージ");
         } else {
             addResultTabBtn.setText("ファイルリスト追加");
         }
         updateTargetTabCombo();
-        boolean grepEnabled = !grepTabSelected;
-        grepField.setEnabled(grepEnabled);
-        grepPathField.setEnabled(grepEnabled);
-        grepFileNameField.setEnabled(grepEnabled);
-        grepExtensionField.setEnabled(grepEnabled);
-        grepRegexCheck.setEnabled(grepEnabled);
-        grepBtn.setEnabled(grepEnabled);
-        grepRecursiveCheck.setEnabled(grepEnabled && getActiveTabGrepPaths().isEmpty());
-        grepContextSpinner.setEnabled(grepEnabled);
-        boolean fileListCopyEnabled = fileListTabSelected && !loading;
-        copyBaseField.setEnabled(fileListCopyEnabled);
-        copyDestField.setEnabled(fileListCopyEnabled);
-        generateCopyScriptBtn.setEnabled(fileListCopyEnabled);
         if (fileListTabSelected && currentPath != null) {
             String currentPathText = PathUtil.toDisplay(currentPath);
             if (copyBaseField.getText().isBlank()) {
                 copyBaseField.setText(currentPathText);
             }
         }
+        updateBusyControls();
+        if (loading) {
+            if (!taskStatusText.isBlank()) {
+                statusLabel.setText(taskStatusText);
+            }
+            return;
+        }
         if (selected != null) {
             statusLabel.setText(selected.statusText());
         } else if (resultTabs.getSelectedIndex() == SETTINGS_TAB_INDEX) {
             statusLabel.setText("設定");
-        } else if (!loading) {
+        } else {
             updateStatusBar(null, "フォルダ一覧");
         }
     }
@@ -1418,9 +1589,7 @@ public class ExplorerFrame extends JFrame {
             return;
         }
 
-        loading = true;
-        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-        statusLabel.setText("Grep 実行中… \"" + pattern + "\"");
+        beginTask(ActiveTask.GREP, "Grep 実行中… \"" + pattern + "\"");
 
         boolean regex = grepRegexCheck.isSelected();
         boolean recursive = grepRecursiveCheck.isSelected();
@@ -1588,9 +1757,8 @@ public class ExplorerFrame extends JFrame {
         if (activeWorker != worker) {
             return;
         }
-        loading = false;
         activeWorker = null;
-        setCursor(Cursor.getDefaultCursor());
+        endTask();
         try {
             if (worker.isCancelled()) {
                 return;
@@ -1676,8 +1844,7 @@ public class ExplorerFrame extends JFrame {
     }
 
     private void updateNavButtons() {
-        backBtn.setEnabled(historyIndex > 0);
-        forwardBtn.setEnabled(historyIndex >= 0 && historyIndex < history.size() - 1);
+        updateBusyControls();
     }
 
     private void showError(String message) {
