@@ -7,10 +7,13 @@ import com.fastexplorer.model.GrepResult;
 import com.fastexplorer.model.ListDirectoryResult;
 import com.fastexplorer.model.SearchOptions;
 import com.fastexplorer.model.SearchResult;
+import com.fastexplorer.model.TaskProgress;
+import com.fastexplorer.util.ProgressThrottle;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -23,9 +26,11 @@ import java.util.function.Consumer;
  * H2 キャッシュを最大限活用:
  * - キャッシュヒット時は即座に返却
  * - 期限切れキャッシュは stale-while-revalidate（表示後にバックグラウンド更新）
- * - 検索は H2 インデックスを優先、不足分は FS 走査でキャッシュを充実
+ * - 検索はまず UNC 以下を H2 にインデックス化し、H2 上で条件検索
  */
 public final class CachedFileSystemService {
+
+    private static final int INDEX_BATCH_SIZE = 500;
 
     private final FileSystemService delegate = new FileSystemService();
     private final TextGrepService grepService = new TextGrepService();
@@ -52,9 +57,12 @@ public final class CachedFileSystemService {
                     long elapsedMs = (System.nanoTime() - start) / 1_000_000;
 
                     if (listing.isFresh() || listing.isStaleButUsable()) {
+                        List<FileEntry> entries = includeSize
+                                ? listing.entries()
+                                : stripMetadata(listing.entries());
                         ListDirectoryResult result = new ListDirectoryResult(
                                 listing.path(),
-                                listing.entries(),
+                                entries,
                                 elapsedMs,
                                 true,
                                 false
@@ -85,32 +93,53 @@ public final class CachedFileSystemService {
             Path rootPath,
             SearchOptions options,
             AtomicBoolean cancel,
+            boolean includeMetadata,
             boolean forceRefresh,
+            long progressStart,
+            Consumer<TaskProgress> onProgress,
             Consumer<SearchResult> onBackgroundRefresh
     ) throws IOException {
         long start = System.nanoTime();
 
-        if (!forceRefresh && options.isSimpleNameQuery()) {
-            String q = options.simpleNameQuery();
-            if (!q.isEmpty()) {
-                try {
-                    List<FileEntry> cachedHits = cache.searchByName(rootPath, q);
-                    if (!cachedHits.isEmpty()) {
-                        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-                        SearchResult result = new SearchResult(rootPath, cachedHits, elapsedMs, true);
+        try {
+            if (forceRefresh) {
+                cache.invalidateTree(rootPath);
+            }
 
-                        if (onBackgroundRefresh != null) {
-                            scheduleSearchRefresh(rootPath, options, cancel, onBackgroundRefresh);
-                        }
-                        return result;
-                    }
-                } catch (SQLException ignored) {
+            Optional<CacheRepository.TreeIndex> index = cache.findTreeIndex(rootPath);
+            int estimatedTotal = index.map(CacheRepository.TreeIndex::entryCount).orElse(-1);
+            boolean needCrawl = forceRefresh
+                    || index.isEmpty()
+                    || !index.get().complete();
+
+            if (!needCrawl && index.get().isStaleButUsable() && !index.get().isFresh()) {
+                SearchResult cached = searchFromCache(
+                        rootPath, options, includeMetadata, start, onProgress, progressStart);
+                if (onBackgroundRefresh != null) {
+                    scheduleTreeReindex(rootPath, cancel, includeMetadata, options, onBackgroundRefresh);
+                }
+                return cached;
+            }
+
+            if (needCrawl) {
+                indexTreeToCache(rootPath, cancel, estimatedTotal, onProgress, progressStart);
+                if (cancel.get()) {
+                    long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                    return new SearchResult(rootPath, List.of(), elapsedMs, true);
                 }
             }
+
+            return searchFromCache(rootPath, options, includeMetadata, start, onProgress, progressStart);
+        } catch (SQLException e) {
+            // キャッシュ障害時は FS にフォールバック
         }
 
-        SearchResult fresh = delegate.searchRecursive(rootPath, options, cancel);
+        SearchResult fresh = delegate.searchRecursive(rootPath, options, cancel, includeMetadata);
         indexSearchResults(fresh.entries());
+        try {
+            cache.saveTreeIndex(rootPath, fresh.entries().size(), !cancel.get());
+        } catch (SQLException ignored) {
+        }
         return fresh;
     }
 
@@ -118,8 +147,8 @@ public final class CachedFileSystemService {
         return delegate.getParent(path);
     }
 
-    public FileEntry toFileEntry(Path path) {
-        return delegate.toFileEntry(path);
+    public FileEntry toFileEntry(Path path, boolean includeMetadata) {
+        return delegate.toFileEntry(path, includeMetadata);
     }
 
     public GrepResult grepText(
@@ -129,9 +158,12 @@ public final class CachedFileSystemService {
             boolean caseSensitive,
             boolean recursive,
             int contextLines,
-            AtomicBoolean cancel
+            AtomicBoolean cancel,
+            long progressStart,
+            Consumer<TaskProgress> onProgress
     ) throws IOException {
-        return grepService.grep(options, pattern, regex, caseSensitive, recursive, contextLines, cancel);
+        return grepService.grep(
+                options, pattern, regex, caseSensitive, recursive, contextLines, cancel, progressStart, onProgress);
     }
 
     public GrepResult grepPaths(
@@ -141,9 +173,12 @@ public final class CachedFileSystemService {
             boolean regex,
             boolean caseSensitive,
             int contextLines,
-            AtomicBoolean cancel
+            AtomicBoolean cancel,
+            long progressStart,
+            Consumer<TaskProgress> onProgress
     ) throws IOException {
-        return grepService.grepPaths(paths, options, pattern, regex, caseSensitive, contextLines, cancel);
+        return grepService.grepPaths(
+                paths, options, pattern, regex, caseSensitive, contextLines, cancel, progressStart, onProgress);
     }
 
     public CacheRepository.CacheStats getCacheStats() throws SQLException {
@@ -156,6 +191,71 @@ public final class CachedFileSystemService {
 
     public void shutdown() {
         refreshExecutor.shutdownNow();
+    }
+
+    private SearchResult searchFromCache(
+            Path rootPath,
+            SearchOptions options,
+            boolean includeMetadata,
+            long startNanos,
+            Consumer<TaskProgress> onProgress,
+            long progressStart
+    ) throws SQLException {
+        int total = (int) Math.min(cache.countUnderRoot(rootPath), Integer.MAX_VALUE);
+        ProgressThrottle throttle = ProgressThrottle.of(onProgress, "H2 検索", total, progressStart);
+        throttle.reportForce(0);
+        List<FileEntry> hits = cache.search(rootPath, options, throttle::report);
+        throttle.reportForce(Math.max(total, 0));
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+        List<FileEntry> entries = includeMetadata ? hits : stripMetadata(hits);
+        return new SearchResult(rootPath, entries, elapsedMs, true);
+    }
+
+    private void indexTreeToCache(
+            Path rootPath,
+            AtomicBoolean cancel,
+            int estimatedTotal,
+            Consumer<TaskProgress> onProgress,
+            long progressStart
+    ) throws IOException, SQLException {
+        int totalHint = estimatedTotal > 0 ? estimatedTotal : -1;
+        ProgressThrottle throttle = ProgressThrottle.of(
+                onProgress, "インデックス作成", totalHint, progressStart);
+        throttle.reportForce(0);
+
+        List<FileEntry> batch = new ArrayList<>(INDEX_BATCH_SIZE);
+        int[] count = {0};
+
+        delegate.indexTree(rootPath, cancel, entry -> {
+            batch.add(entry);
+            count[0]++;
+            if (batch.size() >= INDEX_BATCH_SIZE) {
+                flushIndexBatch(batch);
+            }
+            // 推定を超えたら ? 表示に切り替えず、実処理数を総数として伸ばす
+            if (totalHint > 0 && count[0] > totalHint) {
+                throttle.setTotal(count[0] + INDEX_BATCH_SIZE);
+            }
+            throttle.report(count[0]);
+        });
+
+        if (!batch.isEmpty()) {
+            flushIndexBatch(batch);
+        }
+
+        cache.saveTreeIndex(rootPath, count[0], !cancel.get());
+        throttle.setTotal(count[0]);
+        throttle.reportForce(count[0]);
+    }
+
+    private void flushIndexBatch(List<FileEntry> batch) {
+        try {
+            cache.batchUpsertEntries(batch);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        } finally {
+            batch.clear();
+        }
     }
 
     private void scheduleDirectoryRefresh(
@@ -179,16 +279,22 @@ public final class CachedFileSystemService {
         });
     }
 
-    private void scheduleSearchRefresh(
+    private void scheduleTreeReindex(
             Path rootPath,
-            SearchOptions options,
             AtomicBoolean cancel,
+            boolean includeMetadata,
+            SearchOptions options,
             Consumer<SearchResult> callback
     ) {
         refreshExecutor.submit(() -> {
             try {
-                SearchResult fresh = delegate.searchRecursive(rootPath, options, cancel);
-                indexSearchResults(fresh.entries());
+                cache.invalidateTree(rootPath);
+                indexTreeToCache(rootPath, cancel, -1, null, System.currentTimeMillis());
+                if (cancel.get()) {
+                    return;
+                }
+                SearchResult fresh = searchFromCache(
+                        rootPath, options, includeMetadata, System.nanoTime(), null, System.currentTimeMillis());
                 callback.accept(new SearchResult(
                         fresh.root(),
                         fresh.entries(),
@@ -198,6 +304,18 @@ public final class CachedFileSystemService {
             } catch (Exception ignored) {
             }
         });
+    }
+
+    private static List<FileEntry> stripMetadata(List<FileEntry> entries) {
+        return entries.stream()
+                .map(entry -> new FileEntry(
+                        entry.name(),
+                        entry.path(),
+                        entry.directory(),
+                        null,
+                        null
+                ))
+                .toList();
     }
 
     private void persistListing(ListDirectoryResult result, boolean includeSize) {

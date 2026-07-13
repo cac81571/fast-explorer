@@ -3,8 +3,10 @@ package com.fastexplorer.fs;
 import com.fastexplorer.model.GrepMatch;
 import com.fastexplorer.model.GrepOptions;
 import com.fastexplorer.model.GrepResult;
+import com.fastexplorer.model.TaskProgress;
 import com.fastexplorer.util.FileTypeUtil;
 import com.fastexplorer.util.PathUtil;
+import com.fastexplorer.util.ProgressThrottle;
 import com.fastexplorer.util.WildcardUtil;
 
 import java.io.BufferedReader;
@@ -18,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -35,52 +38,30 @@ public final class TextGrepService {
             boolean caseSensitive,
             boolean recursive,
             int contextLines,
-            AtomicBoolean cancel
+            AtomicBoolean cancel,
+            long progressStart,
+            Consumer<TaskProgress> onProgress
     ) throws IOException {
         long start = System.nanoTime();
         Path root = PathUtil.resolveForAccess(options.searchRoot());
         Pattern linePattern = compilePattern(patternText, regex, caseSensitive);
         Pattern fileNamePattern = WildcardUtil.globToPattern(options.fileNamePattern());
 
-        List<GrepMatch> matches = new ArrayList<>();
-        int[] filesScanned = {0};
-
+        List<CandidateFile> candidates;
         if (recursive) {
-            Files.walkFileTree(root, new SimpleFileVisitor<>() {
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    if (cancel.get() || matches.size() >= MAX_MATCHES) {
-                        return FileVisitResult.TERMINATE;
-                    }
-                    scanFile(file, attrs, options, fileNamePattern, linePattern, contextLines, matches, filesScanned, cancel);
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                    return FileVisitResult.CONTINUE;
-                }
-            });
+            candidates = collectCandidatesRecursive(
+                    root, options, fileNamePattern, cancel, onProgress, progressStart);
         } else {
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(root)) {
-                for (Path entry : stream) {
-                    if (cancel.get() || matches.size() >= MAX_MATCHES) {
-                        break;
-                    }
-                    if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
-                        try {
-                            BasicFileAttributes attrs = Files.readAttributes(
-                                    entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                            scanFile(entry, attrs, options, fileNamePattern, linePattern, contextLines, matches, filesScanned, cancel);
-                        } catch (IOException ignored) {
-                        }
-                    }
-                }
-            }
+            candidates = collectCandidatesInDirectory(
+                    root, options, fileNamePattern, cancel, onProgress, progressStart);
         }
 
+        List<GrepMatch> matches = new ArrayList<>();
+        int filesScanned = grepCandidates(
+                candidates, linePattern, contextLines, matches, cancel, onProgress, progressStart);
+
         long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-        return new GrepResult(root, List.copyOf(matches), elapsedMs, filesScanned[0]);
+        return new GrepResult(root, List.copyOf(matches), elapsedMs, filesScanned);
     }
 
     public GrepResult grepPaths(
@@ -90,16 +71,17 @@ public final class TextGrepService {
             boolean regex,
             boolean caseSensitive,
             int contextLines,
-            AtomicBoolean cancel
+            AtomicBoolean cancel,
+            long progressStart,
+            Consumer<TaskProgress> onProgress
     ) throws IOException {
         long start = System.nanoTime();
         Pattern linePattern = compilePattern(patternText, regex, caseSensitive);
         Pattern fileNamePattern = WildcardUtil.globToPattern(options.fileNamePattern());
-        List<GrepMatch> matches = new ArrayList<>();
-        int[] filesScanned = {0};
 
+        List<CandidateFile> candidates = new ArrayList<>();
         for (Path path : paths) {
-            if (cancel.get() || matches.size() >= MAX_MATCHES) {
+            if (cancel.get()) {
                 break;
             }
             try {
@@ -109,26 +91,111 @@ public final class TextGrepService {
                 }
                 BasicFileAttributes attrs = Files.readAttributes(
                         file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                scanFile(file, attrs, options, fileNamePattern, linePattern, contextLines, matches, filesScanned, cancel);
+                addCandidateIfMatches(file, attrs, options, fileNamePattern, candidates);
             } catch (IOException ignored) {
-                // 個別ファイルの失敗でファイル集合全体の Grep を中断しない
             }
         }
 
+        if (onProgress != null && !candidates.isEmpty()) {
+            onProgress.accept(TaskProgress.of("Grep", 0, candidates.size(), progressStart));
+        }
+
+        List<GrepMatch> matches = new ArrayList<>();
+        int filesScanned = grepCandidates(
+                candidates, linePattern, contextLines, matches, cancel, onProgress, progressStart);
+
         long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-        return new GrepResult(options.searchRoot(), List.copyOf(matches), elapsedMs, filesScanned[0]);
+        return new GrepResult(options.searchRoot(), List.copyOf(matches), elapsedMs, filesScanned);
     }
 
-    private static void scanFile(
+    private static List<CandidateFile> collectCandidatesRecursive(
+            Path root,
+            GrepOptions options,
+            Pattern fileNamePattern,
+            AtomicBoolean cancel,
+            Consumer<TaskProgress> onProgress,
+            long progressStart
+    ) throws IOException {
+        List<CandidateFile> candidates = new ArrayList<>();
+        ProgressThrottle throttle = ProgressThrottle.of(onProgress, "対象ファイル収集", -1, progressStart);
+        throttle.reportForce(0);
+
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            private int visited;
+
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                if (cancel.get()) {
+                    return FileVisitResult.TERMINATE;
+                }
+                visited++;
+                throttle.report(visited);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (cancel.get()) {
+                    return FileVisitResult.TERMINATE;
+                }
+                visited++;
+                addCandidateIfMatches(file, attrs, options, fileNamePattern, candidates);
+                throttle.report(visited);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                return FileVisitResult.CONTINUE;
+            }
+        });
+
+        throttle.reportForce(Math.max(candidates.size(), 0));
+        return candidates;
+    }
+
+    private static List<CandidateFile> collectCandidatesInDirectory(
+            Path root,
+            GrepOptions options,
+            Pattern fileNamePattern,
+            AtomicBoolean cancel,
+            Consumer<TaskProgress> onProgress,
+            long progressStart
+    ) throws IOException {
+        List<CandidateFile> candidates = new ArrayList<>();
+        ProgressThrottle throttle = ProgressThrottle.of(onProgress, "対象ファイル収集", -1, progressStart);
+        throttle.reportForce(0);
+        int visited = 0;
+
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(root)) {
+            for (Path entry : stream) {
+                if (cancel.get()) {
+                    break;
+                }
+                if (!Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
+                visited++;
+                try {
+                    BasicFileAttributes attrs = Files.readAttributes(
+                            entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    addCandidateIfMatches(entry, attrs, options, fileNamePattern, candidates);
+                } catch (IOException ignored) {
+                }
+                throttle.report(visited);
+            }
+        }
+
+        throttle.reportForce(visited);
+        return candidates;
+    }
+
+    private static void addCandidateIfMatches(
             Path file,
             BasicFileAttributes attrs,
             GrepOptions options,
             Pattern fileNamePattern,
-            Pattern linePattern,
-            int contextLines,
-            List<GrepMatch> matches,
-            int[] filesScanned,
-            AtomicBoolean cancel
+            List<CandidateFile> candidates
     ) {
         String fileName = file.getFileName().toString();
         if (!WildcardUtil.matches(fileName, fileNamePattern)) {
@@ -140,8 +207,34 @@ public final class TextGrepService {
         if (attrs.size() > MAX_FILE_BYTES) {
             return;
         }
-        filesScanned[0]++;
-        grepFile(file, linePattern, contextLines, matches, cancel);
+        candidates.add(new CandidateFile(file, attrs.size()));
+    }
+
+    private static int grepCandidates(
+            List<CandidateFile> candidates,
+            Pattern linePattern,
+            int contextLines,
+            List<GrepMatch> matches,
+            AtomicBoolean cancel,
+            Consumer<TaskProgress> onProgress,
+            long progressStart
+    ) {
+        int total = candidates.size();
+        ProgressThrottle throttle = ProgressThrottle.of(onProgress, "Grep", total, progressStart);
+        throttle.reportForce(0);
+
+        int filesScanned = 0;
+        for (int i = 0; i < candidates.size(); i++) {
+            if (cancel.get() || matches.size() >= MAX_MATCHES) {
+                break;
+            }
+            CandidateFile candidate = candidates.get(i);
+            filesScanned++;
+            grepFile(candidate.path(), linePattern, contextLines, matches, cancel);
+            throttle.report(i + 1);
+        }
+        throttle.reportForce(filesScanned);
+        return filesScanned;
     }
 
     static boolean matchesExtension(Path file, List<String> extensions) {
@@ -271,4 +364,6 @@ public final class TextGrepService {
         }
         return Pattern.compile(Pattern.quote(trimmed), flags);
     }
+
+    private record CandidateFile(Path path, long size) {}
 }

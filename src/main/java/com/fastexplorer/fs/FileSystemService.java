@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * Windows エクスプローラが遅い主な原因を避ける:
@@ -78,18 +79,26 @@ public final class FileSystemService {
     }
 
     public FileEntry toFileEntry(Path path) {
+        return toFileEntry(path, true);
+    }
+
+    public FileEntry toFileEntry(Path path, boolean includeMetadata) {
         Path normalized = path.toAbsolutePath().normalize();
         String name = normalized.getFileName() != null
                 ? normalized.getFileName().toString()
                 : normalized.toString();
         try {
             Path access = PathUtil.resolveForAccess(normalized);
-            BasicFileAttributes attrs = Files.readAttributes(
-                    access, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            boolean isDirectory = attrs.isDirectory();
-            Long size = isDirectory ? null : attrs.size();
-            Instant modified = attrs.lastModifiedTime().toInstant();
-            return new FileEntry(name, normalized, isDirectory, size, modified);
+            if (includeMetadata) {
+                BasicFileAttributes attrs = Files.readAttributes(
+                        access, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                boolean isDirectory = attrs.isDirectory();
+                Long size = isDirectory ? null : attrs.size();
+                Instant modified = attrs.lastModifiedTime().toInstant();
+                return new FileEntry(name, normalized, isDirectory, size, modified);
+            }
+            boolean isDirectory = Files.isDirectory(access, LinkOption.NOFOLLOW_LINKS);
+            return new FileEntry(name, normalized, isDirectory, null, null);
         } catch (IOException ex) {
             boolean isDirectory = Files.isDirectory(normalized, LinkOption.NOFOLLOW_LINKS);
             return new FileEntry(name, normalized, isDirectory, null, null);
@@ -99,7 +108,12 @@ public final class FileSystemService {
     /**
      * 指定フォルダ以下を再帰的に検索（パス / ファイル名 glob、拡張子。各項目は OR、項目間は AND）。
      */
-    public SearchResult searchRecursive(Path rootPath, SearchOptions options, AtomicBoolean cancel) throws IOException {
+    public SearchResult searchRecursive(
+            Path rootPath,
+            SearchOptions options,
+            AtomicBoolean cancel,
+            boolean includeMetadata
+    ) throws IOException {
         long start = System.nanoTime();
         Path root = PathUtil.resolveForAccess(rootPath);
 
@@ -139,8 +153,12 @@ public final class FileSystemService {
                 boolean isDirectory = attrs.isDirectory();
                 String name = path.getFileName().toString();
                 if (SearchMatcher.matches(root, path, name, isDirectory, options)) {
-                    Long size = isDirectory ? null : attrs.size();
-                    Instant modified = attrs.lastModifiedTime().toInstant();
+                    Long size = null;
+                    Instant modified = null;
+                    if (includeMetadata) {
+                        size = isDirectory ? null : attrs.size();
+                        modified = attrs.lastModifiedTime().toInstant();
+                    }
                     results.add(new FileEntry(name, path, isDirectory, size, modified));
                 }
             }
@@ -152,5 +170,48 @@ public final class FileSystemService {
 
         long elapsedMs = (System.nanoTime() - start) / 1_000_000;
         return new SearchResult(root, results, elapsedMs);
+    }
+
+    /**
+     * フォルダ以下のパス一覧を走査し、コールバックへ渡す（サイズ・更新日時は取得しない）。
+     */
+    public int indexTree(Path rootPath, AtomicBoolean cancel, Consumer<FileEntry> onEntry) throws IOException {
+        Path root = PathUtil.resolveForAccess(rootPath);
+        int[] count = {0};
+
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                if (cancel.get()) {
+                    return FileVisitResult.TERMINATE;
+                }
+                if (!dir.equals(root)) {
+                    emit(dir, attrs.isDirectory());
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (cancel.get()) {
+                    return FileVisitResult.TERMINATE;
+                }
+                emit(file, attrs.isDirectory());
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                return FileVisitResult.CONTINUE;
+            }
+
+            private void emit(Path path, boolean isDirectory) {
+                String name = path.getFileName().toString();
+                onEntry.accept(new FileEntry(name, path, isDirectory, null, null));
+                count[0]++;
+            }
+        });
+
+        return count[0];
     }
 }

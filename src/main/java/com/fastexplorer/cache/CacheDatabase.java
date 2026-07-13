@@ -73,6 +73,14 @@ public final class CacheDatabase {
                     CREATE INDEX IF NOT EXISTS idx_file_cache_name_lower
                     ON file_cache (LOWER(name))
                     """);
+            st.execute("""
+                    CREATE TABLE IF NOT EXISTS tree_index (
+                        root_path VARCHAR(2048) PRIMARY KEY,
+                        indexed_at TIMESTAMP NOT NULL,
+                        entry_count INT NOT NULL,
+                        complete BOOLEAN NOT NULL
+                    )
+                    """);
         }
     }
 

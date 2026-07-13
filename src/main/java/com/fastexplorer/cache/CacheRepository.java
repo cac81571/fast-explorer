@@ -1,7 +1,9 @@
 package com.fastexplorer.cache;
 
 import com.fastexplorer.model.FileEntry;
+import com.fastexplorer.model.SearchOptions;
 import com.fastexplorer.util.PathUtil;
+import com.fastexplorer.util.SearchMatcher;
 
 import java.nio.file.Path;
 import java.sql.*;
@@ -10,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 public final class CacheRepository {
 
@@ -146,25 +149,11 @@ public final class CacheRepository {
     }
 
     public List<FileEntry> searchByName(Path root, String query) throws SQLException {
-        String rootKey = toKey(root);
-        String likePattern = "%" + query.trim().toLowerCase() + "%";
-        String pathPrefix = rootKey + "\\";
-
         List<FileEntry> results = new ArrayList<>();
-        Connection conn = database.getConnection();
-        try (PreparedStatement ps = conn.prepareStatement("""
-                SELECT path, name, is_directory, size, modified
-                FROM file_cache
-                WHERE LOWER(name) LIKE ?
-                  AND (path = ? OR path LIKE ? ESCAPE '!')
-                """)) {
-            ps.setString(1, likePattern);
-            ps.setString(2, rootKey);
-            ps.setString(3, escapeLike(pathPrefix) + "%");
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    results.add(toEntry(rs));
-                }
+        String normalizedQuery = query.trim().toLowerCase();
+        for (FileEntry entry : listUnderRoot(toKey(root))) {
+            if (entry.name().toLowerCase().contains(normalizedQuery)) {
+                results.add(entry);
             }
         }
 
@@ -172,6 +161,177 @@ public final class CacheRepository {
                 .comparing(FileEntry::directory).reversed()
                 .thenComparing(e -> e.path().toString().toLowerCase()));
         return results;
+    }
+
+    public List<FileEntry> search(Path root, SearchOptions options) throws SQLException {
+        return search(root, options, null);
+    }
+
+    public List<FileEntry> search(
+            Path root,
+            SearchOptions options,
+            Consumer<Integer> onProcessed
+    ) throws SQLException {
+        if (options.isEmpty()) {
+            return List.of();
+        }
+
+        List<FileEntry> all = listUnderRoot(toKey(root));
+        List<FileEntry> results = new ArrayList<>();
+        for (int i = 0; i < all.size(); i++) {
+            FileEntry entry = all.get(i);
+            if (SearchMatcher.matches(root, entry.path(), entry.name(), entry.directory(), options)) {
+                results.add(entry);
+            }
+            if (onProcessed != null) {
+                onProcessed.accept(i + 1);
+            }
+        }
+
+        results.sort(Comparator
+                .comparing(FileEntry::directory).reversed()
+                .thenComparing(e -> e.path().toString().toLowerCase()));
+        return results;
+    }
+
+    public long countUnderRoot(Path root) throws SQLException {
+        String rootKey = toKey(root);
+        Connection conn = database.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("""
+                SELECT COUNT(*)
+                FROM file_cache
+                WHERE path = ? OR path LIKE ? ESCAPE '!'
+                """)) {
+            ps.setString(1, rootKey);
+            ps.setString(2, escapeLike(rootKey) + "%");
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getLong(1);
+            }
+        }
+    }
+
+    public Optional<TreeIndex> findTreeIndex(Path root) throws SQLException {
+        String rootKey = toKey(root);
+        Connection conn = database.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("""
+                SELECT indexed_at, entry_count, complete
+                FROM tree_index
+                WHERE root_path = ?
+                """)) {
+            ps.setString(1, rootKey);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return Optional.empty();
+                }
+                return Optional.of(new TreeIndex(
+                        root,
+                        rs.getTimestamp("indexed_at").toInstant(),
+                        rs.getInt("entry_count"),
+                        rs.getBoolean("complete")
+                ));
+            }
+        }
+    }
+
+    public void saveTreeIndex(Path root, int entryCount, boolean complete) throws SQLException {
+        String rootKey = toKey(root);
+        Connection conn = database.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("""
+                MERGE INTO tree_index (root_path, indexed_at, entry_count, complete)
+                KEY (root_path)
+                VALUES (?, ?, ?, ?)
+                """)) {
+            ps.setString(1, rootKey);
+            ps.setTimestamp(2, Timestamp.from(Instant.now()));
+            ps.setInt(3, entryCount);
+            ps.setBoolean(4, complete);
+            ps.executeUpdate();
+        }
+    }
+
+    public void invalidateTree(Path root) throws SQLException {
+        String rootKey = toKey(root);
+        Connection conn = database.getConnection();
+        conn.setAutoCommit(false);
+        try {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    DELETE FROM file_cache
+                    WHERE path = ? OR path LIKE ? ESCAPE '!'
+                    """)) {
+                ps.setString(1, rootKey);
+                ps.setString(2, escapeLike(rootKey) + "%");
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM tree_index WHERE root_path = ?")) {
+                ps.setString(1, rootKey);
+                ps.executeUpdate();
+            }
+            conn.commit();
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(true);
+        }
+    }
+
+    public void batchUpsertEntries(List<FileEntry> entries) throws SQLException {
+        if (entries.isEmpty()) {
+            return;
+        }
+
+        Instant now = Instant.now();
+        Connection conn = database.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("""
+                MERGE INTO file_cache
+                (path, parent_path, name, is_directory, size, modified, cached_at)
+                KEY (path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """)) {
+            for (FileEntry entry : entries) {
+                Path parent = entry.path().getParent();
+                if (parent == null) {
+                    continue;
+                }
+                ps.setString(1, toKey(entry.path()));
+                ps.setString(2, toKey(parent));
+                ps.setString(3, entry.name());
+                ps.setBoolean(4, entry.directory());
+                if (entry.size() != null) {
+                    ps.setLong(5, entry.size());
+                } else {
+                    ps.setNull(5, Types.BIGINT);
+                }
+                if (entry.modified() != null) {
+                    ps.setTimestamp(6, Timestamp.from(entry.modified()));
+                } else {
+                    ps.setNull(6, Types.TIMESTAMP);
+                }
+                ps.setTimestamp(7, Timestamp.from(now));
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+    }
+
+    private List<FileEntry> listUnderRoot(String rootKey) throws SQLException {
+        List<FileEntry> entries = new ArrayList<>();
+        Connection conn = database.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("""
+                SELECT path, name, is_directory, size, modified
+                FROM file_cache
+                WHERE path = ? OR path LIKE ? ESCAPE '!'
+                """)) {
+            ps.setString(1, rootKey);
+            ps.setString(2, escapeLike(rootKey) + "%");
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(toEntry(rs));
+                }
+            }
+        }
+        return entries;
     }
 
     public void upsertEntry(Path parent, FileEntry entry) throws SQLException {
@@ -225,6 +385,7 @@ public final class CacheRepository {
         try (Statement st = conn.createStatement()) {
             st.execute("DELETE FROM file_cache");
             st.execute("DELETE FROM dir_cache");
+            st.execute("DELETE FROM tree_index");
         }
     }
 
@@ -258,6 +419,20 @@ public final class CacheRepository {
 
         public boolean isStaleButUsable() {
             return ageMs() < STALE_MS;
+        }
+    }
+
+    public record TreeIndex(Path root, Instant indexedAt, int entryCount, boolean complete) {
+        public long ageMs() {
+            return System.currentTimeMillis() - indexedAt.toEpochMilli();
+        }
+
+        public boolean isFresh() {
+            return complete && ageMs() < FRESH_MS;
+        }
+
+        public boolean isStaleButUsable() {
+            return complete && ageMs() < STALE_MS;
         }
     }
 
