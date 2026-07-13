@@ -93,8 +93,7 @@ public final class CachedFileSystemService {
             SearchOptions options,
             AtomicBoolean cancel,
             boolean includeMetadata,
-            boolean forceRefresh,
-            Consumer<SearchResult> onBackgroundRefresh
+            boolean forceRefresh
     ) throws IOException {
         long start = System.nanoTime();
 
@@ -106,22 +105,17 @@ public final class CachedFileSystemService {
             Optional<CacheRepository.TreeIndex> index = cache.findTreeIndex(rootPath);
             boolean needCrawl = forceRefresh
                     || index.isEmpty()
-                    || !index.get().complete();
+                    || index.get().needsRebuild();
 
-            if (!needCrawl && index.get().isStaleButUsable() && !index.get().isFresh()) {
-                SearchResult cached = searchFromCache(rootPath, options, includeMetadata, start);
-                if (onBackgroundRefresh != null) {
-                    scheduleTreeReindex(rootPath, cancel, includeMetadata, options, onBackgroundRefresh);
-                }
-                return cached;
+            // 期限切れ前のインデックスはバックグラウンド再構築せずそのまま使う
+            if (!needCrawl) {
+                return searchFromCache(rootPath, options, includeMetadata, start);
             }
 
-            if (needCrawl) {
-                indexTreeToCache(rootPath, cancel);
-                if (cancel.get()) {
-                    long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-                    return new SearchResult(rootPath, List.of(), elapsedMs, true);
-                }
+            indexTreeToCache(rootPath, cancel);
+            if (cancel.get()) {
+                long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                return new SearchResult(rootPath, List.of(), elapsedMs, true);
             }
 
             return searchFromCache(rootPath, options, includeMetadata, start);
@@ -136,6 +130,29 @@ public final class CachedFileSystemService {
         } catch (SQLException ignored) {
         }
         return fresh;
+    }
+
+    /**
+     * 現在フォルダ以下を事前インデックスする。forceRefresh=true で作り直し。
+     */
+    public int buildTreeIndex(Path rootPath, boolean forceRefresh, AtomicBoolean cancel) throws IOException {
+        try {
+            if (forceRefresh) {
+                cache.invalidateTree(rootPath);
+            } else {
+                Optional<CacheRepository.TreeIndex> index = cache.findTreeIndex(rootPath);
+                if (index.isPresent() && !index.get().needsRebuild()) {
+                    return index.get().entryCount();
+                }
+            }
+            return indexTreeToCache(rootPath, cancel);
+        } catch (SQLException e) {
+            throw new IOException("インデックス作成に失敗しました: " + e.getMessage(), e);
+        }
+    }
+
+    public Optional<CacheRepository.TreeIndex> findTreeIndex(Path rootPath) throws SQLException {
+        return cache.findTreeIndex(rootPath);
     }
 
     public Path getParent(Path path) {
@@ -200,7 +217,7 @@ public final class CachedFileSystemService {
         return new SearchResult(rootPath, entries, elapsedMs, true);
     }
 
-    private void indexTreeToCache(Path rootPath, AtomicBoolean cancel) throws IOException, SQLException {
+    private int indexTreeToCache(Path rootPath, AtomicBoolean cancel) throws IOException, SQLException {
         List<FileEntry> batch = new ArrayList<>(INDEX_BATCH_SIZE);
         int[] count = {0};
 
@@ -217,6 +234,7 @@ public final class CachedFileSystemService {
         }
 
         cache.saveTreeIndex(rootPath, count[0], !cancel.get());
+        return count[0];
     }
 
     private void flushIndexBatch(List<FileEntry> batch) {
@@ -244,32 +262,6 @@ public final class CachedFileSystemService {
                         fresh.elapsedMs(),
                         false,
                         true
-                ));
-            } catch (Exception ignored) {
-            }
-        });
-    }
-
-    private void scheduleTreeReindex(
-            Path rootPath,
-            AtomicBoolean cancel,
-            boolean includeMetadata,
-            SearchOptions options,
-            Consumer<SearchResult> callback
-    ) {
-        refreshExecutor.submit(() -> {
-            try {
-                cache.invalidateTree(rootPath);
-                indexTreeToCache(rootPath, cancel);
-                if (cancel.get()) {
-                    return;
-                }
-                SearchResult fresh = searchFromCache(rootPath, options, includeMetadata, System.nanoTime());
-                callback.accept(new SearchResult(
-                        fresh.root(),
-                        fresh.entries(),
-                        fresh.elapsedMs(),
-                        false
                 ));
             } catch (Exception ignored) {
             }

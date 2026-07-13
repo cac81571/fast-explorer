@@ -22,6 +22,9 @@ public final class CacheDatabase {
     public synchronized Connection getConnection() throws SQLException {
         if (connection == null || connection.isClosed()) {
             open();
+        } else {
+            // 既存接続でもマイグレーションを再適用（アプリ更新後も欠けたテーブルを補完）
+            initSchema(connection);
         }
         return connection;
     }

@@ -84,6 +84,7 @@ public class ExplorerFrame extends JFrame {
     private final HistoryTextField searchFileNameField = new HistoryTextField("search.file");
     private final HistoryTextField searchExtensionField = new HistoryTextField("search.extension");
     private final JButton searchBtn = new JButton("検索");
+    private final JButton indexBtn = new JButton("インデックス");
     private final JButton saveSearchFavoriteBtn = new JButton("★");
     private final JLabel statusLabel = new JLabel(" ");
     private final JProgressBar taskProgressBar = new JProgressBar();
@@ -105,6 +106,7 @@ public class ExplorerFrame extends JFrame {
         NONE,
         DIRECTORY,
         SEARCH,
+        INDEX,
         GREP,
         COPY
     }
@@ -369,6 +371,7 @@ public class ExplorerFrame extends JFrame {
         searchFileNameField.setToolTipText("ファイル名（* ? で glob、カンマ区切り。ワイルドカードなしは部分一致）▼ で履歴");
         searchExtensionField.setToolTipText("拡張子（カンマ区切り、例: .java,.xml または java,log、フォルダ）▼ で履歴");
         subfolderSearchCheck.setToolTipText("ON のとき検索ボタン / Enter で現在のフォルダ以下を再帰検索");
+        indexBtn.setToolTipText("現在のフォルダ以下を検索用に事前インデックス（有効期限 7 日、作り直しは再実行）");
         addResultTabBtn.setToolTipText("Grep結果のファイルパスをファイルリストタブへ追加 / ファイルリストタブをマージ");
         copyBaseField.setToolTipText("このフォルダ以降の階層を維持してコピー（空=現在のパス）▼ で履歴");
         copyDestField.setToolTipText("コピー先フォルダ（相対/絶対/UNC 可）▼ で履歴");
@@ -509,7 +512,15 @@ public class ExplorerFrame extends JFrame {
             }
             runSubfolderSearch();
         });
+        indexBtn.addActionListener(e -> {
+            if (activeTask == ActiveTask.INDEX) {
+                requestCancelActiveTask("インデックス");
+                return;
+            }
+            runTreeIndex(true);
+        });
         searchActions.add(saveSearchFavoriteBtn);
+        searchActions.add(indexBtn);
         searchActions.add(searchBtn);
 
         JPanel searchRow = new JPanel(new BorderLayout(8, 0));
@@ -612,7 +623,10 @@ public class ExplorerFrame extends JFrame {
         setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
         statusLabel.setText(statusText);
         taskProgressBar.setVisible(
-                task == ActiveTask.SEARCH || task == ActiveTask.GREP || task == ActiveTask.COPY);
+                task == ActiveTask.SEARCH
+                        || task == ActiveTask.INDEX
+                        || task == ActiveTask.GREP
+                        || task == ActiveTask.COPY);
         taskProgressBar.setIndeterminate(true);
         taskProgressBar.setValue(0);
         taskProgressBar.setMaximum(100);
@@ -652,11 +666,14 @@ public class ExplorerFrame extends JFrame {
     private void updateBusyControls() {
         boolean busy = loading;
         boolean searching = activeTask == ActiveTask.SEARCH;
+        boolean indexing = activeTask == ActiveTask.INDEX;
         boolean grepping = activeTask == ActiveTask.GREP;
         boolean copying = activeTask == ActiveTask.COPY;
 
         searchBtn.setText(searching ? "検索キャンセル" : "検索");
         searchBtn.setEnabled(!busy || searching);
+        indexBtn.setText(indexing ? "インデックスキャンセル" : "インデックス");
+        indexBtn.setEnabled(!busy || indexing);
         searchPathField.setEnabled(!busy);
         searchFileNameField.setEnabled(!busy);
         searchExtensionField.setEnabled(!busy);
@@ -804,11 +821,25 @@ public class ExplorerFrame extends JFrame {
         help.setFont(UIManager.getFont("Label.font"));
         help.setForeground(UIManager.getColor("Label.disabledForeground"));
 
+        JTextArea indexHelp = new JTextArea(
+                "検索バーの「インデックス」で現在フォルダ以下を事前登録できます。\n"
+                        + "検索用インデックスの有効期限は 7 日です（フォルダ一覧キャッシュは従来どおり短め）。\n"
+                        + "再作成したいときは、もう一度「インデックス」を実行してください。"
+        );
+        indexHelp.setEditable(false);
+        indexHelp.setFocusable(false);
+        indexHelp.setOpaque(false);
+        indexHelp.setBorder(null);
+        indexHelp.setFont(UIManager.getFont("Label.font"));
+        indexHelp.setForeground(UIManager.getColor("Label.disabledForeground"));
+
         JPanel content = new JPanel();
         content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
         content.add(metadataRow);
         content.add(Box.createVerticalStrut(4));
         content.add(metadataHelp);
+        content.add(Box.createVerticalStrut(12));
+        content.add(indexHelp);
         content.add(Box.createVerticalStrut(12));
         content.add(editorRow);
         content.add(Box.createVerticalStrut(8));
@@ -1038,13 +1069,44 @@ public class ExplorerFrame extends JFrame {
                         searchOptions,
                         searchCancel,
                         includeMetadata,
-                        forceRefresh,
-                        fresh -> SwingUtilities.invokeLater(() -> applySearchResult(fresh, searchTab)));
+                        forceRefresh);
             }
 
             @Override
             protected void done() {
                 finishActiveWorker(this, result -> applySearchResult(result, searchTab));
+            }
+        };
+        activeWorker = worker;
+        worker.execute();
+    }
+
+    private void runTreeIndex(boolean forceRefresh) {
+        if (currentPath == null || loading) {
+            return;
+        }
+
+        cancelActiveWorker();
+        searchCancel.set(false);
+        beginTask(ActiveTask.INDEX, "インデックス作成中… " + PathUtil.toDisplay(currentPath));
+
+        final Path root = currentPath;
+        SwingWorker<Integer, Void> worker = new SwingWorker<>() {
+            @Override
+            protected Integer doInBackground() throws Exception {
+                return fs.buildTreeIndex(root, forceRefresh, searchCancel);
+            }
+
+            @Override
+            protected void done() {
+                finishActiveWorker(this, count -> {
+                    if (searchCancel.get()) {
+                        statusLabel.setText("インデックスをキャンセルしました");
+                        return;
+                    }
+                    statusLabel.setText("インデックス完了: " + String.format("%,d", count)
+                            + " 件  |  有効期限 7 日  |  " + PathUtil.toDisplay(root));
+                });
             }
         };
         activeWorker = worker;
@@ -1883,6 +1945,7 @@ public class ExplorerFrame extends JFrame {
 
     private void requestCancelActiveTask(String taskName) {
         if (activeTask != ActiveTask.SEARCH
+                && activeTask != ActiveTask.INDEX
                 && activeTask != ActiveTask.GREP
                 && activeTask != ActiveTask.COPY) {
             return;
@@ -1910,6 +1973,8 @@ public class ExplorerFrame extends JFrame {
             if (worker.isCancelled()) {
                 if (finishedTask == ActiveTask.SEARCH) {
                     statusLabel.setText("検索をキャンセルしました");
+                } else if (finishedTask == ActiveTask.INDEX) {
+                    statusLabel.setText("インデックスをキャンセルしました");
                 } else if (finishedTask == ActiveTask.GREP) {
                     statusLabel.setText("Grep をキャンセルしました");
                 } else if (finishedTask == ActiveTask.COPY) {

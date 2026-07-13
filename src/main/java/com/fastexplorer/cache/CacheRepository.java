@@ -15,8 +15,13 @@ import java.util.Optional;
 
 public final class CacheRepository {
 
+    /** フォルダ一覧キャッシュの鮮度 */
     static final long FRESH_MS = 2 * 60 * 1000L;
     static final long STALE_MS = 30 * 60 * 1000L;
+
+    /** 検索用ツリーインデックスの寿命（UNC 向けに長め） */
+    static final long TREE_FRESH_MS = 24 * 60 * 60 * 1000L;
+    static final long TREE_STALE_MS = 7 * 24 * 60 * 60 * 1000L;
 
     private final CacheDatabase database;
 
@@ -397,11 +402,15 @@ public final class CacheRepository {
         }
 
         public boolean isFresh() {
-            return complete && ageMs() < FRESH_MS;
+            return complete && ageMs() < TREE_FRESH_MS;
         }
 
         public boolean isStaleButUsable() {
-            return complete && ageMs() < STALE_MS;
+            return complete && ageMs() < TREE_STALE_MS;
+        }
+
+        public boolean needsRebuild() {
+            return !complete || ageMs() >= TREE_STALE_MS;
         }
     }
 
