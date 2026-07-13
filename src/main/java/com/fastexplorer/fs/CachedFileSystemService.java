@@ -8,7 +8,6 @@ import com.fastexplorer.model.ListDirectoryResult;
 import com.fastexplorer.model.SearchOptions;
 import com.fastexplorer.model.SearchResult;
 import com.fastexplorer.model.TaskProgress;
-import com.fastexplorer.util.ProgressThrottle;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -95,8 +94,6 @@ public final class CachedFileSystemService {
             AtomicBoolean cancel,
             boolean includeMetadata,
             boolean forceRefresh,
-            long progressStart,
-            Consumer<TaskProgress> onProgress,
             Consumer<SearchResult> onBackgroundRefresh
     ) throws IOException {
         long start = System.nanoTime();
@@ -107,14 +104,12 @@ public final class CachedFileSystemService {
             }
 
             Optional<CacheRepository.TreeIndex> index = cache.findTreeIndex(rootPath);
-            int estimatedTotal = index.map(CacheRepository.TreeIndex::entryCount).orElse(-1);
             boolean needCrawl = forceRefresh
                     || index.isEmpty()
                     || !index.get().complete();
 
             if (!needCrawl && index.get().isStaleButUsable() && !index.get().isFresh()) {
-                SearchResult cached = searchFromCache(
-                        rootPath, options, includeMetadata, start, onProgress, progressStart);
+                SearchResult cached = searchFromCache(rootPath, options, includeMetadata, start);
                 if (onBackgroundRefresh != null) {
                     scheduleTreeReindex(rootPath, cancel, includeMetadata, options, onBackgroundRefresh);
                 }
@@ -122,14 +117,14 @@ public final class CachedFileSystemService {
             }
 
             if (needCrawl) {
-                indexTreeToCache(rootPath, cancel, estimatedTotal, onProgress, progressStart);
+                indexTreeToCache(rootPath, cancel);
                 if (cancel.get()) {
                     long elapsedMs = (System.nanoTime() - start) / 1_000_000;
                     return new SearchResult(rootPath, List.of(), elapsedMs, true);
                 }
             }
 
-            return searchFromCache(rootPath, options, includeMetadata, start, onProgress, progressStart);
+            return searchFromCache(rootPath, options, includeMetadata, start);
         } catch (SQLException e) {
             // キャッシュ障害時は FS にフォールバック
         }
@@ -197,32 +192,15 @@ public final class CachedFileSystemService {
             Path rootPath,
             SearchOptions options,
             boolean includeMetadata,
-            long startNanos,
-            Consumer<TaskProgress> onProgress,
-            long progressStart
+            long startNanos
     ) throws SQLException {
-        int total = (int) Math.min(cache.countUnderRoot(rootPath), Integer.MAX_VALUE);
-        ProgressThrottle throttle = ProgressThrottle.of(onProgress, "H2 検索", total, progressStart);
-        throttle.reportForce(0);
-        List<FileEntry> hits = cache.search(rootPath, options, throttle::report);
-        throttle.reportForce(Math.max(total, 0));
+        List<FileEntry> hits = cache.search(rootPath, options);
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
         List<FileEntry> entries = includeMetadata ? hits : stripMetadata(hits);
         return new SearchResult(rootPath, entries, elapsedMs, true);
     }
 
-    private void indexTreeToCache(
-            Path rootPath,
-            AtomicBoolean cancel,
-            int estimatedTotal,
-            Consumer<TaskProgress> onProgress,
-            long progressStart
-    ) throws IOException, SQLException {
-        int totalHint = estimatedTotal > 0 ? estimatedTotal : -1;
-        ProgressThrottle throttle = ProgressThrottle.of(
-                onProgress, "インデックス作成", totalHint, progressStart);
-        throttle.reportForce(0);
-
+    private void indexTreeToCache(Path rootPath, AtomicBoolean cancel) throws IOException, SQLException {
         List<FileEntry> batch = new ArrayList<>(INDEX_BATCH_SIZE);
         int[] count = {0};
 
@@ -232,11 +210,6 @@ public final class CachedFileSystemService {
             if (batch.size() >= INDEX_BATCH_SIZE) {
                 flushIndexBatch(batch);
             }
-            // 推定を超えたら ? 表示に切り替えず、実処理数を総数として伸ばす
-            if (totalHint > 0 && count[0] > totalHint) {
-                throttle.setTotal(count[0] + INDEX_BATCH_SIZE);
-            }
-            throttle.report(count[0]);
         });
 
         if (!batch.isEmpty()) {
@@ -244,8 +217,6 @@ public final class CachedFileSystemService {
         }
 
         cache.saveTreeIndex(rootPath, count[0], !cancel.get());
-        throttle.setTotal(count[0]);
-        throttle.reportForce(count[0]);
     }
 
     private void flushIndexBatch(List<FileEntry> batch) {
@@ -289,12 +260,11 @@ public final class CachedFileSystemService {
         refreshExecutor.submit(() -> {
             try {
                 cache.invalidateTree(rootPath);
-                indexTreeToCache(rootPath, cancel, -1, null, System.currentTimeMillis());
+                indexTreeToCache(rootPath, cancel);
                 if (cancel.get()) {
                     return;
                 }
-                SearchResult fresh = searchFromCache(
-                        rootPath, options, includeMetadata, System.nanoTime(), null, System.currentTimeMillis());
+                SearchResult fresh = searchFromCache(rootPath, options, includeMetadata, System.nanoTime());
                 callback.accept(new SearchResult(
                         fresh.root(),
                         fresh.entries(),

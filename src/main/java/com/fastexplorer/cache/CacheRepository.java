@@ -12,7 +12,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Consumer;
 
 public final class CacheRepository {
 
@@ -164,27 +163,14 @@ public final class CacheRepository {
     }
 
     public List<FileEntry> search(Path root, SearchOptions options) throws SQLException {
-        return search(root, options, null);
-    }
-
-    public List<FileEntry> search(
-            Path root,
-            SearchOptions options,
-            Consumer<Integer> onProcessed
-    ) throws SQLException {
         if (options.isEmpty()) {
             return List.of();
         }
 
-        List<FileEntry> all = listUnderRoot(toKey(root));
         List<FileEntry> results = new ArrayList<>();
-        for (int i = 0; i < all.size(); i++) {
-            FileEntry entry = all.get(i);
+        for (FileEntry entry : listUnderRoot(toKey(root))) {
             if (SearchMatcher.matches(root, entry.path(), entry.name(), entry.directory(), options)) {
                 results.add(entry);
-            }
-            if (onProcessed != null) {
-                onProcessed.accept(i + 1);
             }
         }
 
@@ -192,23 +178,6 @@ public final class CacheRepository {
                 .comparing(FileEntry::directory).reversed()
                 .thenComparing(e -> e.path().toString().toLowerCase()));
         return results;
-    }
-
-    public long countUnderRoot(Path root) throws SQLException {
-        String rootKey = toKey(root);
-        Connection conn = database.getConnection();
-        try (PreparedStatement ps = conn.prepareStatement("""
-                SELECT COUNT(*)
-                FROM file_cache
-                WHERE path = ? OR path LIKE ? ESCAPE '!'
-                """)) {
-            ps.setString(1, rootKey);
-            ps.setString(2, escapeLike(rootKey) + "%");
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
-        }
     }
 
     public Optional<TreeIndex> findTreeIndex(Path root) throws SQLException {

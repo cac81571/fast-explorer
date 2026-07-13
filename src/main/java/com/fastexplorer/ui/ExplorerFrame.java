@@ -1025,12 +1025,11 @@ public class ExplorerFrame extends JFrame {
         cancelActiveWorker();
         searchCancel.set(false);
 
-        beginTask(ActiveTask.SEARCH, TaskProgress.of("検索準備", 0, -1, System.currentTimeMillis()).formatStatus());
+        beginTask(ActiveTask.SEARCH, "検索中… " + formatSearchCriteria(options));
 
         final ResultTabPanel[] searchTab = new ResultTabPanel[1];
         final SearchOptions searchOptions = options;
         final boolean includeMetadata = fetchMetadata();
-        final long progressStart = taskStartedAtMs;
         SwingWorker<SearchResult, Void> worker = new SwingWorker<>() {
             @Override
             protected SearchResult doInBackground() throws Exception {
@@ -1040,8 +1039,6 @@ public class ExplorerFrame extends JFrame {
                         searchCancel,
                         includeMetadata,
                         forceRefresh,
-                        progressStart,
-                        progress -> SwingUtilities.invokeLater(() -> updateTaskProgress(progress)),
                         fresh -> SwingUtilities.invokeLater(() -> applySearchResult(fresh, searchTab)));
             }
 
@@ -1059,9 +1056,6 @@ public class ExplorerFrame extends JFrame {
             return;
         }
         List<FileEntry> entries = result.entries();
-        if (activeTask == ActiveTask.SEARCH && loading) {
-            updateTaskStatus("検索中… " + entries.size() + " 件  |  " + formatSearchCriteria(buildSearchOptions()));
-        }
         if (entries.isEmpty()) {
             if (tabHolder[0] == null) {
                 JOptionPane.showMessageDialog(
