@@ -5,10 +5,12 @@ import java.util.List;
 
 public record GrepOptions(
         Path searchRoot,
+        List<String> pathPatterns,
         String fileNamePattern,
         List<String> extensions
 ) {
     public GrepOptions {
+        pathPatterns = pathPatterns != null ? List.copyOf(pathPatterns) : List.of();
         extensions = extensions != null ? List.copyOf(extensions) : List.of();
         fileNamePattern = fileNamePattern != null ? fileNamePattern.trim() : "";
     }

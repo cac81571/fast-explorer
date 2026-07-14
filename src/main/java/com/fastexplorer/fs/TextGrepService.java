@@ -207,6 +207,9 @@ public final class TextGrepService {
             List<CandidateFile> candidates,
             boolean requireTextWhenExtensionEmpty
     ) {
+        if (!matchesPathPatterns(file, options.pathPatterns())) {
+            return;
+        }
         String fileName = file.getFileName().toString();
         if (!WildcardUtil.matches(fileName, fileNamePattern)) {
             return;
@@ -218,6 +221,42 @@ public final class TextGrepService {
             return;
         }
         candidates.add(new CandidateFile(file, attrs.size()));
+    }
+
+    /** パス条件: ワイルドカードなしは部分一致、あれば glob（フルパス対象）。 */
+    private static boolean matchesPathPatterns(Path file, List<String> pathPatterns) {
+        if (pathPatterns == null || pathPatterns.isEmpty()) {
+            return true;
+        }
+        String display = PathUtil.toDisplay(file).replace('\\', '/');
+        String absolute;
+        try {
+            absolute = file.toAbsolutePath().normalize().toString().replace('\\', '/');
+        } catch (Exception ex) {
+            absolute = display;
+        }
+        for (String raw : pathPatterns) {
+            if (raw == null || raw.isBlank()) {
+                continue;
+            }
+            String pattern = raw.trim().replace('\\', '/');
+            if (!containsWildcard(pattern)) {
+                String needle = pattern.toLowerCase();
+                if (display.toLowerCase().contains(needle) || absolute.toLowerCase().contains(needle)) {
+                    return true;
+                }
+                continue;
+            }
+            Pattern glob = WildcardUtil.globToPattern(pattern);
+            if (WildcardUtil.matches(display, glob) || WildcardUtil.matches(absolute, glob)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsWildcard(String value) {
+        return value.indexOf('*') >= 0 || value.indexOf('?') >= 0;
     }
 
     private static int grepCandidates(

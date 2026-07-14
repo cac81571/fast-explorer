@@ -16,7 +16,7 @@ import com.fastexplorer.util.ExternalEditorOpener;
 import com.fastexplorer.util.FileTypeUtil;
 import com.fastexplorer.util.LocalFileOpener;
 import com.fastexplorer.util.PathUtil;
-import com.fastexplorer.fs.FileCopyService;
+import com.fastexplorer.util.PowerShellCopyScriptBuilder;
 import com.fastexplorer.util.SearchMatcher;
 
 import javax.swing.*;
@@ -103,21 +103,20 @@ public class ExplorerFrame extends JFrame {
     private static final String GREP_TAB_PREFIX = "Grep結果";
     private static final String FILE_LIST_TAB_PREFIX = "ファイルリスト";
     private static final String FILE_LIST_NEW_TAB = "新規タブ";
+    private static final String SCRIPT_TAB_TITLE = "スクリプト";
     private enum ActiveTask {
         NONE,
         DIRECTORY,
         SEARCH,
         INDEX,
-        GREP,
-        COPY
+        GREP
     }
 
     private final JComboBox<String> targetTabCombo = new JComboBox<>();
     private final JButton addResultTabBtn = new JButton("ファイルリスト追加");
     private final HistoryTextField copyBaseField = new HistoryTextField("filelist.copy.base");
     private final HistoryTextField copyDestField = new HistoryTextField("filelist.copy.dest");
-    private final JButton copyFilesBtn = new JButton("コピー実行");
-    private final FileCopyService copyService = new FileCopyService();
+    private final JButton generateCopyScriptBtn = new JButton("コピーコマンド(PS)生成");
     private int nextGrepResultNumber = 1;
     private int nextFileListNumber = 1;
 
@@ -377,7 +376,7 @@ public class ExplorerFrame extends JFrame {
         addResultTabBtn.setToolTipText("Grep結果のファイルパスをファイルリストタブへ追加 / ファイルリストタブをマージ");
         copyBaseField.setToolTipText("このフォルダ以降の階層を維持してコピー（空=現在のパス）▼ で履歴");
         copyDestField.setToolTipText("コピー先フォルダ（相対/絶対/UNC 可）▼ で履歴");
-        copyFilesBtn.setToolTipText("ファイルリストの選択ファイルをコピー（未選択時は全ファイル、既存は上書き）");
+        generateCopyScriptBtn.setToolTipText("PowerShell の mkdir / Copy-Item スクリプトを生成（未選択時は全ファイル）");
         targetTabCombo.setToolTipText("追加先（新規タブ / ファイルリスト …）");
         pathCombo.setEditable(true);
         pathCombo.setToolTipText("パスを入力するか、履歴から選択");
@@ -457,13 +456,7 @@ public class ExplorerFrame extends JFrame {
         });
 
         addResultTabBtn.addActionListener(e -> addOrMergeFileListTab());
-        copyFilesBtn.addActionListener(e -> {
-            if (activeTask == ActiveTask.COPY) {
-                requestCancelActiveTask("コピー");
-                return;
-            }
-            runCopyFiles();
-        });
+        generateCopyScriptBtn.addActionListener(e -> generateCopyScript());
 
         grepField.addEditorActionListener(e -> runGrep());
 
@@ -588,7 +581,7 @@ public class ExplorerFrame extends JFrame {
                 "コピー先", copyDestField
         );
         grepRow4.add(copyFields, BorderLayout.CENTER);
-        grepRow4.add(copyFilesBtn, BorderLayout.EAST);
+        grepRow4.add(generateCopyScriptBtn, BorderLayout.EAST);
         grepBar.add(grepRow4);
         north.add(grepBar);
 
@@ -632,8 +625,7 @@ public class ExplorerFrame extends JFrame {
         taskProgressBar.setVisible(
                 task == ActiveTask.SEARCH
                         || task == ActiveTask.INDEX
-                        || task == ActiveTask.GREP
-                        || task == ActiveTask.COPY);
+                        || task == ActiveTask.GREP);
         taskProgressBar.setIndeterminate(true);
         taskProgressBar.setValue(0);
         taskProgressBar.setMaximum(100);
@@ -675,7 +667,6 @@ public class ExplorerFrame extends JFrame {
         boolean searching = activeTask == ActiveTask.SEARCH;
         boolean indexing = activeTask == ActiveTask.INDEX;
         boolean grepping = activeTask == ActiveTask.GREP;
-        boolean copying = activeTask == ActiveTask.COPY;
 
         ResultTabPanel selected = getSelectedResultTab();
         boolean grepTabSelected = selected != null && selected.kind() == ResultTabKind.GREP_RESULT;
@@ -703,6 +694,9 @@ public class ExplorerFrame extends JFrame {
         grepBtn.setEnabled(grepControlsEnabled || grepping);
         grepField.setEnabled(grepControlsEnabled);
         grepPathField.setEnabled(grepControlsEnabled);
+        grepPathField.setToolTipText(fileListTabSelected
+                ? "パスの絞り込み（* ? で glob、カンマ区切り。ワイルドカードなしは部分一致）▼ で履歴"
+                : "検索開始パス（空=現在のフォルダ、相対/絶対/UNC 可）▼ で履歴");
         grepFileNameField.setEnabled(grepControlsEnabled);
         grepExtensionField.setEnabled(grepControlsEnabled);
         grepRegexCheck.setEnabled(grepControlsEnabled);
@@ -714,11 +708,10 @@ public class ExplorerFrame extends JFrame {
         addResultTabBtn.setEnabled(fileListControlsEnabled);
         targetTabCombo.setEnabled(fileListControlsEnabled);
 
-        boolean fileListCopyEnabled = fileListTabSelected && (!busy || copying);
+        boolean fileListCopyEnabled = fileListTabSelected && !busy;
         copyBaseField.setEnabled(fileListTabSelected && !busy);
         copyDestField.setEnabled(fileListTabSelected && !busy);
-        copyFilesBtn.setText(copying ? "コピーキャンセル" : "コピー実行");
-        copyFilesBtn.setEnabled(fileListCopyEnabled);
+        generateCopyScriptBtn.setEnabled(fileListCopyEnabled);
 
         backBtn.setEnabled(!busy && historyIndex > 0);
         forwardBtn.setEnabled(!busy && historyIndex >= 0 && historyIndex < history.size() - 1);
@@ -1404,7 +1397,7 @@ public class ExplorerFrame extends JFrame {
         onResultTabSelectionChanged();
     }
 
-    private void runCopyFiles() {
+    private void generateCopyScript() {
         if (loading) {
             return;
         }
@@ -1450,75 +1443,33 @@ public class ExplorerFrame extends JFrame {
             return;
         }
 
-        int confirm = JOptionPane.showConfirmDialog(
-                this,
-                entries.size() + " 件のファイルをコピーします。\n"
-                        + "コピー先: " + PathUtil.toDisplay(destDir) + "\n"
-                        + "既存ファイルは上書きされます。よろしいですか？",
-                "コピーの確認",
-                JOptionPane.OK_CANCEL_OPTION,
-                JOptionPane.QUESTION_MESSAGE
-        );
-        if (confirm != JOptionPane.OK_OPTION) {
-            return;
-        }
-
         copyBaseField.commitHistory();
         copyDestField.commitHistory();
 
-        cancelActiveWorker();
-        searchCancel.set(false);
-        beginTask(ActiveTask.COPY, TaskProgress.of("コピー", 0, entries.size(), System.currentTimeMillis()).formatStatus());
-
-        final List<FileEntry> copyEntries = List.copyOf(entries);
-        final long progressStart = taskStartedAtMs;
-        SwingWorker<FileCopyService.CopyResult, Void> worker = new SwingWorker<>() {
-            @Override
-            protected FileCopyService.CopyResult doInBackground() throws Exception {
-                return copyService.copyFiles(
-                        copyEntries,
-                        destDir,
-                        hierarchyBase,
-                        searchCancel,
-                        progressStart,
-                        progress -> SwingUtilities.invokeLater(() -> updateTaskProgress(progress))
-                );
-            }
-
-            @Override
-            protected void done() {
-                finishActiveWorker(this, ExplorerFrame.this::applyCopyResult);
-            }
-        };
-        activeWorker = worker;
-        worker.execute();
+        String script = PowerShellCopyScriptBuilder.build(entries, destDir, hierarchyBase);
+        showCopyScript(script);
     }
 
-    private void applyCopyResult(FileCopyService.CopyResult result) {
-        statusLabel.setText(result.summary());
-        if (result.failed() > 0 && !result.errors().isEmpty()) {
-            StringBuilder message = new StringBuilder();
-            message.append(result.summary()).append("\n\n");
-            for (String error : result.errors()) {
-                message.append("・").append(error).append('\n');
-            }
-            if (result.failed() > result.errors().size()) {
-                message.append("・… 他 ").append(result.failed() - result.errors().size()).append(" 件\n");
-            }
-            JOptionPane.showMessageDialog(
-                    this,
-                    message.toString(),
-                    "コピー結果",
-                    JOptionPane.WARNING_MESSAGE
-            );
-        } else if (!result.cancelled()) {
-            JOptionPane.showMessageDialog(
-                    this,
-                    result.summary(),
-                    "コピー結果",
-                    JOptionPane.INFORMATION_MESSAGE
-            );
+    private void showCopyScript(String script) {
+        ResultTabPanel scriptTab = findScriptTab();
+        if (scriptTab == null) {
+            scriptTab = new ResultTabPanel(ResultTabKind.SCRIPT);
+            resultTabs.addTab(SCRIPT_TAB_TITLE, scriptTab);
         }
+        scriptTab.setScriptText(script);
+        resultTabs.setSelectedComponent(scriptTab);
+        statusLabel.setText(scriptTab.statusText());
+        onResultTabSelectionChanged();
+    }
+
+    private ResultTabPanel findScriptTab() {
+        for (int i = FIRST_DYNAMIC_TAB_INDEX; i < resultTabs.getTabCount(); i++) {
+            ResultTabPanel panel = getResultTabAt(i);
+            if (panel != null && panel.kind() == ResultTabKind.SCRIPT) {
+                return panel;
+            }
+        }
+        return null;
     }
 
     private Path resolveFolderPath(String pathText) throws IOException {
@@ -1885,22 +1836,25 @@ public class ExplorerFrame extends JFrame {
     }
 
     private GrepOptions buildGrepOptions() throws IOException {
-        Path searchRoot;
         List<Path> fileListPaths = getActiveTabGrepPaths();
+        Path searchRoot;
+        List<String> pathPatterns;
         if (!fileListPaths.isEmpty()) {
-            searchRoot = fileListPaths.stream()
-                    .findFirst()
-                    .map(Path::getParent)
-                    .orElse(currentPath);
+            // ファイルリスト Grep: パス欄は開始パスではなくフィルタ（部分一致 / glob）
+            searchRoot = currentPath != null
+                    ? currentPath
+                    : fileListPaths.stream().map(Path::getParent).filter(p -> p != null).findFirst().orElse(null);
+            pathPatterns = parseCommaList(grepPathField.getText());
         } else {
             searchRoot = resolveGrepSearchRoot();
+            pathPatterns = List.of();
         }
         if (searchRoot == null) {
             searchRoot = Paths.get(System.getProperty("user.home"));
         }
         String fileNamePattern = grepFileNameField.getText().trim();
         List<String> extensions = parseExtensionList(grepExtensionField.getText());
-        return new GrepOptions(searchRoot, fileNamePattern, extensions);
+        return new GrepOptions(searchRoot, pathPatterns, fileNamePattern, extensions);
     }
 
     private Path resolveGrepSearchRoot() throws IOException {
@@ -1994,8 +1948,7 @@ public class ExplorerFrame extends JFrame {
     private void requestCancelActiveTask(String taskName) {
         if (activeTask != ActiveTask.SEARCH
                 && activeTask != ActiveTask.INDEX
-                && activeTask != ActiveTask.GREP
-                && activeTask != ActiveTask.COPY) {
+                && activeTask != ActiveTask.GREP) {
             return;
         }
         cancelActiveWorker();
@@ -2025,8 +1978,6 @@ public class ExplorerFrame extends JFrame {
                     statusLabel.setText("インデックスをキャンセルしました");
                 } else if (finishedTask == ActiveTask.GREP) {
                     statusLabel.setText("Grep をキャンセルしました");
-                } else if (finishedTask == ActiveTask.COPY) {
-                    statusLabel.setText("コピーをキャンセルしました");
                 }
                 return;
             }
