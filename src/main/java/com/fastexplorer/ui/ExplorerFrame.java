@@ -381,7 +381,7 @@ public class ExplorerFrame extends JFrame {
         targetTabCombo.setToolTipText("追加先（新規タブ / ファイルリスト …）");
         pathCombo.setEditable(true);
         pathCombo.setToolTipText("パスを入力するか、履歴から選択");
-        grepField.setToolTipText("テキストファイル内を検索（Enter で実行）▼ で履歴");
+        grepField.setToolTipText("本文検索（空だとパス/ファイル名/拡張子に合うファイル一覧）▼ で履歴");
         grepPathField.setToolTipText("検索開始パス（空=現在のフォルダ、相対/絶対/UNC 可）▼ で履歴");
         grepFileNameField.setToolTipText("対象ファイル名（ワイルドカード: * ? 例: *.java, test?.txt）▼ で履歴");
         grepExtensionField.setToolTipText("拡張子（空=テキスト系すべて、例: .java,.xml または java,log）▼ で履歴");
@@ -1803,9 +1803,6 @@ public class ExplorerFrame extends JFrame {
             return;
         }
         String pattern = grepField.getText().trim();
-        if (pattern.isEmpty()) {
-            return;
-        }
 
         cancelActiveWorker();
         searchCancel.set(false);
@@ -1826,7 +1823,8 @@ public class ExplorerFrame extends JFrame {
             return;
         }
 
-        beginTask(ActiveTask.GREP, TaskProgress.of("Grep 準備", 0, -1, System.currentTimeMillis()).formatStatus());
+        String prepareLabel = pattern.isEmpty() ? "ファイル一覧 準備" : "Grep 準備";
+        beginTask(ActiveTask.GREP, TaskProgress.of(prepareLabel, 0, -1, System.currentTimeMillis()).formatStatus());
 
         boolean regex = grepRegexCheck.isSelected();
         boolean recursive = grepRecursiveCheck.isSelected();
@@ -1875,6 +1873,11 @@ public class ExplorerFrame extends JFrame {
     private static String formatGrepResultMode(GrepResult result) {
         long hitCount = result.matches().stream().filter(GrepMatch::matched).count();
         int rowCount = result.matches().size();
+        boolean fileListOnly = rowCount > 0 && result.matches().stream()
+                .allMatch(match -> match.matched() && match.lineNumber() == 0);
+        if (fileListOnly) {
+            return "ファイル一覧: " + hitCount + " ファイル";
+        }
         String countText = hitCount == rowCount
                 ? hitCount + " 件"
                 : hitCount + " 件 (" + rowCount + " 行)";
@@ -1936,9 +1939,10 @@ public class ExplorerFrame extends JFrame {
         }
         try {
             Path path = resolvePathForEditorOpen(match.path());
-            ExternalEditorOpener.openAtLine(editorCommand, path, match.lineNumber());
+            int line = Math.max(1, match.lineNumber());
+            ExternalEditorOpener.openAtLine(editorCommand, path, line);
             grepEditorField.commitHistory();
-            statusLabel.setText("エディタで開きました: " + PathUtil.toDisplay(path) + ":" + match.lineNumber());
+            statusLabel.setText("エディタで開きました: " + PathUtil.toDisplay(path) + ":" + line);
         } catch (IOException ex) {
             showError(formatError(ex));
         }

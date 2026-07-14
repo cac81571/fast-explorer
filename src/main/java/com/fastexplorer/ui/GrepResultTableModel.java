@@ -68,13 +68,16 @@ final class GrepResultTableModel extends AbstractTableModel {
         return switch (column) {
             case 0 -> PathUtil.toDisplay(match.path());
             case 1 -> fileName(match);
-            case 2 -> match.lineNumber();
+            case 2 -> match.lineNumber() > 0 ? match.lineNumber() : "";
             case 3 -> formatLineContent(match);
             default -> "";
         };
     }
 
     private static String formatLineContent(GrepMatch match) {
+        if (match.lineNumber() <= 0) {
+            return "";
+        }
         return (match.matched() ? ": " : "- ") + match.line();
     }
 

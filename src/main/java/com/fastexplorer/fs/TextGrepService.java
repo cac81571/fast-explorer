@@ -44,7 +44,7 @@ public final class TextGrepService {
     ) throws IOException {
         long start = System.nanoTime();
         Path root = PathUtil.resolveForAccess(options.searchRoot());
-        Pattern linePattern = compilePattern(patternText, regex, caseSensitive);
+        Pattern linePattern = compilePatternOrNull(patternText, regex, caseSensitive);
         Pattern fileNamePattern = WildcardUtil.globToPattern(options.fileNamePattern());
 
         List<CandidateFile> candidates;
@@ -77,7 +77,7 @@ public final class TextGrepService {
             Consumer<TaskProgress> onProgress
     ) throws IOException {
         long start = System.nanoTime();
-        Pattern linePattern = compilePattern(patternText, regex, caseSensitive);
+        Pattern linePattern = compilePatternOrNull(patternText, regex, caseSensitive);
         Pattern fileNamePattern = WildcardUtil.globToPattern(options.fileNamePattern());
 
         List<CandidateFile> candidates = new ArrayList<>();
@@ -240,7 +240,12 @@ public final class TextGrepService {
             }
             CandidateFile candidate = candidates.get(i);
             filesScanned++;
-            grepFile(candidate.path(), linePattern, contextLines, matches, cancel);
+            if (linePattern == null) {
+                // 条件空白: 本文検索せず、ファイル条件に合ったファイルを一覧（行=0）
+                matches.add(new GrepMatch(candidate.path(), 0, "", true));
+            } else {
+                grepFile(candidate.path(), linePattern, contextLines, matches, cancel);
+            }
             throttle.report(i + 1);
         }
         throttle.reportForce(filesScanned);
@@ -374,9 +379,18 @@ public final class TextGrepService {
         return line.substring(0, MAX_LINE_DISPLAY) + "…";
     }
 
+    /** 空白パターンは null（ファイル一覧モード）。 */
+    static Pattern compilePatternOrNull(String patternText, boolean regex, boolean caseSensitive)
+            throws PatternSyntaxException {
+        if (patternText == null || patternText.isBlank()) {
+            return null;
+        }
+        return compilePattern(patternText, regex, caseSensitive);
+    }
+
     static Pattern compilePattern(String patternText, boolean regex, boolean caseSensitive)
             throws PatternSyntaxException {
-        String trimmed = patternText.trim();
+        String trimmed = patternText == null ? "" : patternText.trim();
         if (trimmed.isEmpty()) {
             throw new PatternSyntaxException("empty pattern", trimmed, -1);
         }

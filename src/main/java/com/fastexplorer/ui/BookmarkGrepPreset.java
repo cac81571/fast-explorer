@@ -12,7 +12,10 @@ public record BookmarkGrepPreset(
         int context
 ) {
     public boolean isEmpty() {
-        return pattern == null || pattern.isBlank();
+        return (pattern == null || pattern.isBlank())
+                && (path == null || path.isBlank())
+                && (file == null || file.isBlank())
+                && (extension == null || extension.isBlank());
     }
 
     public String defaultName() {
