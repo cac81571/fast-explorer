@@ -1683,7 +1683,7 @@ public class ExplorerFrame extends JFrame {
         if (selected == null) {
             return List.of();
         }
-        return selected.scopePaths();
+        return selected.grepTargetPaths();
     }
 
     private static List<Path> uniquePathsFromGrepMatches(List<GrepMatch> matches) {
@@ -2215,6 +2215,39 @@ public class ExplorerFrame extends JFrame {
             return scopePaths;
         }
 
+        /**
+         * Grep 対象パス。ファイルリストでは表示内容から都度計算し、選択行があればそれを優先する。
+         */
+        List<Path> grepTargetPaths() {
+            if (kind == ResultTabKind.GREP_RESULT) {
+                return uniquePathsFromGrepMatches(grepModel.getMatches());
+            }
+            if (kind != ResultTabKind.FILE_LIST) {
+                return List.of();
+            }
+            List<FileEntry> sources = selectedFileEntriesForCopy();
+            if (sources.isEmpty()) {
+                // 未選択時は全ファイル（ディレクトリ除く）
+                sources = fileModel.getEntries().stream()
+                        .filter(entry -> !entry.directory())
+                        .toList();
+            }
+            Map<Path, Path> unique = new LinkedHashMap<>();
+            for (FileEntry entry : sources) {
+                Path normalized = normalizePathSafe(entry.path());
+                unique.putIfAbsent(normalized, normalized);
+            }
+            return List.copyOf(unique.values());
+        }
+
+        private static Path normalizePathSafe(Path path) {
+            try {
+                return path.toAbsolutePath().normalize();
+            } catch (Exception ex) {
+                return path.normalize();
+            }
+        }
+
         String statusText() {
             if (kind == ResultTabKind.SCRIPT) {
                 int lines = scriptArea.getLineCount();
@@ -2227,9 +2260,10 @@ public class ExplorerFrame extends JFrame {
                 String countLabel = matchCount == rowCount
                         ? matchCount + " 件"
                         : matchCount + " 件 (" + rowCount + " 行)";
-                return countLabel + "  |  " + scopePaths.size() + " ファイル  |  " + kindLabel;
+                return countLabel + "  |  " + grepTargetPaths().size() + " ファイル  |  " + kindLabel;
             }
-            return fileModel.getRowCount() + " 件  |  " + scopePaths.size() + " ファイル  |  " + kindLabel;
+            long fileCount = fileModel.getEntries().stream().filter(entry -> !entry.directory()).count();
+            return fileModel.getRowCount() + " 件  |  " + fileCount + " ファイル  |  " + kindLabel;
         }
 
         private void showFileTable() {
@@ -2251,13 +2285,18 @@ public class ExplorerFrame extends JFrame {
         private void refreshScopePaths() {
             if (kind == ResultTabKind.GREP_RESULT) {
                 scopePaths = uniquePathsFromGrepMatches(grepModel.getMatches());
+            } else if (kind == ResultTabKind.FILE_LIST) {
+                Map<Path, Path> unique = new LinkedHashMap<>();
+                for (FileEntry entry : fileModel.getEntries()) {
+                    if (entry.directory()) {
+                        continue;
+                    }
+                    Path normalized = normalizePathSafe(entry.path());
+                    unique.putIfAbsent(normalized, normalized);
+                }
+                scopePaths = List.copyOf(unique.values());
             } else {
-                scopePaths = fileModel.getEntries().stream()
-                        .filter(entry -> !entry.directory())
-                        .map(FileEntry::path)
-                        .map(path -> path.toAbsolutePath().normalize())
-                        .distinct()
-                        .toList();
+                scopePaths = List.of();
             }
         }
 
