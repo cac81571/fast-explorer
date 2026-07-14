@@ -184,13 +184,15 @@ public final class CachedFileSystemService {
             String pattern,
             boolean regex,
             boolean caseSensitive,
+            boolean recursive,
             int contextLines,
             AtomicBoolean cancel,
             long progressStart,
             Consumer<TaskProgress> onProgress
     ) throws IOException {
         return grepService.grepPaths(
-                paths, options, pattern, regex, caseSensitive, contextLines, cancel, progressStart, onProgress);
+                paths, options, pattern, regex, caseSensitive, recursive, contextLines,
+                cancel, progressStart, onProgress);
     }
 
     public CacheRepository.CacheStats getCacheStats() throws SQLException {

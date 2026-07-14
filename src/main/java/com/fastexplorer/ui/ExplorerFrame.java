@@ -89,6 +89,7 @@ public class ExplorerFrame extends JFrame {
     private final JLabel statusLabel = new JLabel(" ");
     private final JProgressBar taskProgressBar = new JProgressBar();
     private final JCheckBox subfolderSearchCheck = new JCheckBox("サブフォルダも検索", true);
+    private final JCheckBox directoriesOnlySearchCheck = new JCheckBox("フォルダのみ", false);
     private final JButton backBtn = new JButton("←");
     private final JButton forwardBtn = new JButton("→");
     private final JButton upBtn = new JButton("↑");
@@ -369,8 +370,9 @@ public class ExplorerFrame extends JFrame {
         fetchMetadataCheck.setToolTipText("OFF にするとサイズ・更新日時の取得を省略し、一覧・検索を高速化できます");
         searchPathField.setToolTipText("相対パス（* ? で glob、カンマ区切り。ワイルドカードなしは部分一致）▼ で履歴");
         searchFileNameField.setToolTipText("ファイル名（* ? で glob、カンマ区切り。ワイルドカードなしは部分一致）▼ で履歴");
-        searchExtensionField.setToolTipText("拡張子（カンマ区切り、例: .java,.xml または java,log、フォルダ）▼ で履歴");
+        searchExtensionField.setToolTipText("拡張子（カンマ区切り、例: .java,.xml または java,log）▼ で履歴");
         subfolderSearchCheck.setToolTipText("ON のとき検索ボタン / Enter で現在のフォルダ以下を再帰検索");
+        directoriesOnlySearchCheck.setToolTipText("ON のときフォルダだけを検索対象にする（ファイルは除外）");
         indexBtn.setToolTipText("現在のフォルダ以下を検索用に事前インデックス（有効期限 7 日、作り直しは再実行）");
         addResultTabBtn.setToolTipText("Grep結果のファイルパスをファイルリストタブへ追加 / ファイルリストタブをマージ");
         copyBaseField.setToolTipText("このフォルダ以降の階層を維持してコピー（空=現在のパス）▼ で履歴");
@@ -385,7 +387,7 @@ public class ExplorerFrame extends JFrame {
         grepExtensionField.setToolTipText("拡張子（空=テキスト系すべて、例: .java,.xml または java,log）▼ で履歴");
         grepEditorField.setToolTipText("Grep結果ダブルクリック時に実行するコマンド（例: code -g {file}:{line}）▼ で履歴");
         grepRegexCheck.setToolTipText("正規表現として解釈");
-        grepRecursiveCheck.setToolTipText("サブフォルダ内も検索（エクスプローラタブ選択時）");
+        grepRecursiveCheck.setToolTipText("サブフォルダ内も検索（フォルダ Grep / ファイルリスト内のフォルダ）");
         grepContextSpinner.setToolTipText("ヒット行の前後に表示する行数（0=ヒット行のみ）");
 
         backBtn.addActionListener(e -> goBack());
@@ -449,6 +451,10 @@ public class ExplorerFrame extends JFrame {
         searchExtensionField.getDocument().addDocumentListener(filterListener);
 
         subfolderSearchCheck.addActionListener(e -> applyFilters());
+        directoriesOnlySearchCheck.addActionListener(e -> {
+            updateBusyControls();
+            applyFilters();
+        });
 
         addResultTabBtn.addActionListener(e -> addOrMergeFileListTab());
         copyFilesBtn.addActionListener(e -> {
@@ -502,6 +508,7 @@ public class ExplorerFrame extends JFrame {
                 "拡張子", searchExtensionField
         );
         JPanel searchActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        searchActions.add(directoriesOnlySearchCheck);
         searchActions.add(subfolderSearchCheck);
         saveSearchFavoriteBtn.setToolTipText("現在の検索条件をお気に入りに追加");
         saveSearchFavoriteBtn.addActionListener(e -> favoritesPanel.addCurrentSearch());
@@ -670,19 +677,26 @@ public class ExplorerFrame extends JFrame {
         boolean grepping = activeTask == ActiveTask.GREP;
         boolean copying = activeTask == ActiveTask.COPY;
 
-        searchBtn.setText(searching ? "検索キャンセル" : "検索");
-        searchBtn.setEnabled(!busy || searching);
-        indexBtn.setText(indexing ? "インデックスキャンセル" : "インデックス");
-        indexBtn.setEnabled(!busy || indexing);
-        searchPathField.setEnabled(!busy);
-        searchFileNameField.setEnabled(!busy);
-        searchExtensionField.setEnabled(!busy);
-        subfolderSearchCheck.setEnabled(!busy);
-        saveSearchFavoriteBtn.setEnabled(!busy);
-
         ResultTabPanel selected = getSelectedResultTab();
         boolean grepTabSelected = selected != null && selected.kind() == ResultTabKind.GREP_RESULT;
         boolean fileListTabSelected = selected != null && selected.kind() == ResultTabKind.FILE_LIST;
+        boolean resultTabSelected = grepTabSelected || fileListTabSelected;
+        boolean searchControlsEnabled = !busy && !resultTabSelected;
+
+        searchBtn.setText(searching ? "検索キャンセル" : "検索");
+        searchBtn.setEnabled(searchControlsEnabled || searching);
+        searchBtn.setToolTipText(resultTabSelected && !searching
+                ? "結果タブでは検索できません（ファイルリストの絞り込みは未対応。Grep を使ってください）"
+                : "現在のフォルダ以下を検索");
+        indexBtn.setText(indexing ? "インデックスキャンセル" : "インデックス");
+        indexBtn.setEnabled((!busy && !resultTabSelected) || indexing);
+        searchPathField.setEnabled(searchControlsEnabled);
+        searchFileNameField.setEnabled(searchControlsEnabled);
+        searchExtensionField.setEnabled(searchControlsEnabled && !directoriesOnlySearchCheck.isSelected());
+        subfolderSearchCheck.setEnabled(searchControlsEnabled);
+        directoriesOnlySearchCheck.setEnabled(searchControlsEnabled);
+        saveSearchFavoriteBtn.setEnabled(searchControlsEnabled);
+
         boolean grepControlsEnabled = !busy && !grepTabSelected;
 
         grepBtn.setText(grepping ? "Grepキャンセル" : "Grep");
@@ -692,7 +706,7 @@ public class ExplorerFrame extends JFrame {
         grepFileNameField.setEnabled(grepControlsEnabled);
         grepExtensionField.setEnabled(grepControlsEnabled);
         grepRegexCheck.setEnabled(grepControlsEnabled);
-        grepRecursiveCheck.setEnabled(grepControlsEnabled && getActiveTabGrepPaths().isEmpty());
+        grepRecursiveCheck.setEnabled(grepControlsEnabled);
         grepContextSpinner.setEnabled(grepControlsEnabled);
         saveGrepFavoriteBtn.setEnabled(!busy);
 
@@ -737,7 +751,8 @@ public class ExplorerFrame extends JFrame {
         return new BookmarkSearchPreset(
                 searchPathField.getText().trim(),
                 searchFileNameField.getText().trim(),
-                searchExtensionField.getText().trim()
+                searchExtensionField.getText().trim(),
+                directoriesOnlySearchCheck.isSelected()
         );
     }
 
@@ -745,6 +760,8 @@ public class ExplorerFrame extends JFrame {
         searchPathField.setText(preset.pathPatterns());
         searchFileNameField.setText(preset.filePatterns());
         searchExtensionField.setText(preset.extensions());
+        directoriesOnlySearchCheck.setSelected(preset.directoriesOnly());
+        updateBusyControls();
     }
 
     private BookmarkGrepPreset getCurrentGrepPreset() {
@@ -1040,6 +1057,12 @@ public class ExplorerFrame extends JFrame {
         if (currentPath == null || loading) {
             return;
         }
+        ResultTabPanel selected = getSelectedResultTab();
+        if (selected != null && (selected.kind() == ResultTabKind.FILE_LIST
+                || selected.kind() == ResultTabKind.GREP_RESULT)) {
+            statusLabel.setText("結果タブでは検索できません（Grep を使ってください）");
+            return;
+        }
 
         SearchOptions options = buildSearchOptions();
         if (options.isEmpty()) {
@@ -1083,6 +1106,20 @@ public class ExplorerFrame extends JFrame {
 
     private void runTreeIndex(boolean forceRefresh) {
         if (currentPath == null || loading) {
+            return;
+        }
+
+        int confirm = JOptionPane.showConfirmDialog(
+                this,
+                "現在のフォルダ以下を検索用にインデックスします。\n"
+                        + "対象: " + PathUtil.toDisplay(currentPath) + "\n"
+                        + (forceRefresh ? "既存のインデックスがある場合は作り直します。\n" : "")
+                        + "ネットワークフォルダでは時間がかかることがあります。よろしいですか？",
+                "インデックスの確認",
+                JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE
+        );
+        if (confirm != JOptionPane.OK_OPTION) {
             return;
         }
 
@@ -1183,10 +1220,12 @@ public class ExplorerFrame extends JFrame {
     }
 
     private SearchOptions buildSearchOptions() {
+        boolean directoriesOnly = directoriesOnlySearchCheck.isSelected();
         return new SearchOptions(
                 parseCommaList(searchPathField.getText()),
                 parseCommaList(searchFileNameField.getText()),
-                parseCommaList(searchExtensionField.getText())
+                directoriesOnly ? List.of() : parseCommaList(searchExtensionField.getText()),
+                directoriesOnly
         );
     }
 
@@ -1208,8 +1247,11 @@ public class ExplorerFrame extends JFrame {
         if (!options.fileNamePatterns().isEmpty()) {
             parts.add("ファイル=" + String.join("|", options.fileNamePatterns()));
         }
-        if (!options.extensions().isEmpty()) {
+        if (!options.extensions().isEmpty() && !options.directoriesOnly()) {
             parts.add("拡張子=" + String.join("|", options.extensions()));
+        }
+        if (options.directoriesOnly()) {
+            parts.add("フォルダのみ");
         }
         return String.join(" ", parts);
     }
@@ -1256,6 +1298,7 @@ public class ExplorerFrame extends JFrame {
         searchPathField.setText("");
         searchFileNameField.setText("");
         searchExtensionField.setText("");
+        directoriesOnlySearchCheck.setSelected(false);
         tableSorter.setRowFilter(null);
         tableModel.setDisplayBase(null);
     }
@@ -1796,7 +1839,8 @@ public class ExplorerFrame extends JFrame {
                 Consumer<TaskProgress> onProgress = progress -> SwingUtilities.invokeLater(() -> updateTaskProgress(progress));
                 if (!explicitPaths.isEmpty()) {
                     return fs.grepPaths(
-                            explicitPaths, options, pattern, regex, false, contextLines, searchCancel, progressStart, onProgress);
+                            explicitPaths, options, pattern, regex, false, recursive, contextLines,
+                            searchCancel, progressStart, onProgress);
                 }
                 return fs.grepText(
                         options, pattern, regex, false, recursive, contextLines, searchCancel, progressStart, onProgress);
@@ -2217,6 +2261,7 @@ public class ExplorerFrame extends JFrame {
 
         /**
          * Grep 対象パス。ファイルリストでは表示内容から都度計算し、選択行があればそれを優先する。
+         * フォルダも含める（「サブフォルダ」ON なら配下を再帰検索）。
          */
         List<Path> grepTargetPaths() {
             if (kind == ResultTabKind.GREP_RESULT) {
@@ -2225,12 +2270,9 @@ public class ExplorerFrame extends JFrame {
             if (kind != ResultTabKind.FILE_LIST) {
                 return List.of();
             }
-            List<FileEntry> sources = selectedFileEntriesForCopy();
+            List<FileEntry> sources = selectedFileEntriesForGrep();
             if (sources.isEmpty()) {
-                // 未選択時は全ファイル（ディレクトリ除く）
-                sources = fileModel.getEntries().stream()
-                        .filter(entry -> !entry.directory())
-                        .toList();
+                sources = List.copyOf(fileModel.getEntries());
             }
             Map<Path, Path> unique = new LinkedHashMap<>();
             for (FileEntry entry : sources) {
@@ -2238,6 +2280,25 @@ public class ExplorerFrame extends JFrame {
                 unique.putIfAbsent(normalized, normalized);
             }
             return List.copyOf(unique.values());
+        }
+
+        /** Grep 用: ファイルとフォルダの両方。選択なしなら空（呼び出し側で全件）。 */
+        List<FileEntry> selectedFileEntriesForGrep() {
+            if (kind != ResultTabKind.FILE_LIST) {
+                return List.of();
+            }
+            int[] viewRows = resultTable.getSelectedRows();
+            if (viewRows.length == 0) {
+                return List.of();
+            }
+            List<FileEntry> selected = new ArrayList<>();
+            for (int viewRow : viewRows) {
+                FileEntry entry = fileModel.getEntry(resultTable.convertRowIndexToModel(viewRow));
+                if (entry != null) {
+                    selected.add(entry);
+                }
+            }
+            return selected;
         }
 
         private static Path normalizePathSafe(Path path) {

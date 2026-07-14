@@ -5,7 +5,8 @@ import java.util.List;
 public record SearchOptions(
         List<String> pathPatterns,
         List<String> fileNamePatterns,
-        List<String> extensions
+        List<String> extensions,
+        boolean directoriesOnly
 ) {
     public SearchOptions {
         pathPatterns = pathPatterns != null ? List.copyOf(pathPatterns) : List.of();
@@ -20,6 +21,7 @@ public record SearchOptions(
     public boolean isSimpleNameQuery() {
         return pathPatterns.isEmpty()
                 && extensions.isEmpty()
+                && !directoriesOnly
                 && fileNamePatterns.size() == 1
                 && !containsWildcard(fileNamePatterns.get(0));
     }

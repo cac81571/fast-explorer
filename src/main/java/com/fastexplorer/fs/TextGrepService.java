@@ -70,6 +70,7 @@ public final class TextGrepService {
             String patternText,
             boolean regex,
             boolean caseSensitive,
+            boolean recursive,
             int contextLines,
             AtomicBoolean cancel,
             long progressStart,
@@ -85,13 +86,21 @@ public final class TextGrepService {
                 break;
             }
             try {
-                Path file = PathUtil.resolveForAccess(path);
-                if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
-                    continue;
+                Path resolved = PathUtil.resolveForAccess(path);
+                if (Files.isDirectory(resolved, LinkOption.NOFOLLOW_LINKS)) {
+                    if (recursive) {
+                        candidates.addAll(collectCandidatesRecursive(
+                                resolved, options, fileNamePattern, cancel, onProgress, progressStart));
+                    } else {
+                        candidates.addAll(collectCandidatesInDirectory(
+                                resolved, options, fileNamePattern, cancel, onProgress, progressStart));
+                    }
+                } else if (Files.isRegularFile(resolved, LinkOption.NOFOLLOW_LINKS)) {
+                    BasicFileAttributes attrs = Files.readAttributes(
+                            resolved, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    // 明示パス集合: 拡張子未指定なら全ファイル対象（テキスト限定にしない）
+                    addCandidateIfMatches(resolved, attrs, options, fileNamePattern, candidates, false);
                 }
-                BasicFileAttributes attrs = Files.readAttributes(
-                        file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                addCandidateIfMatches(file, attrs, options, fileNamePattern, candidates);
             } catch (IOException ignored) {
             }
         }
@@ -139,7 +148,7 @@ public final class TextGrepService {
                     return FileVisitResult.TERMINATE;
                 }
                 visited++;
-                addCandidateIfMatches(file, attrs, options, fileNamePattern, candidates);
+                addCandidateIfMatches(file, attrs, options, fileNamePattern, candidates, true);
                 throttle.report(visited);
                 return FileVisitResult.CONTINUE;
             }
@@ -179,7 +188,7 @@ public final class TextGrepService {
                 try {
                     BasicFileAttributes attrs = Files.readAttributes(
                             entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                    addCandidateIfMatches(entry, attrs, options, fileNamePattern, candidates);
+                    addCandidateIfMatches(entry, attrs, options, fileNamePattern, candidates, true);
                 } catch (IOException ignored) {
                 }
                 throttle.report(visited);
@@ -195,13 +204,14 @@ public final class TextGrepService {
             BasicFileAttributes attrs,
             GrepOptions options,
             Pattern fileNamePattern,
-            List<CandidateFile> candidates
+            List<CandidateFile> candidates,
+            boolean requireTextWhenExtensionEmpty
     ) {
         String fileName = file.getFileName().toString();
         if (!WildcardUtil.matches(fileName, fileNamePattern)) {
             return;
         }
-        if (!matchesExtension(file, options.extensions())) {
+        if (!matchesExtension(file, options.extensions(), requireTextWhenExtensionEmpty)) {
             return;
         }
         if (attrs.size() > MAX_FILE_BYTES) {
@@ -238,12 +248,24 @@ public final class TextGrepService {
     }
 
     static boolean matchesExtension(Path file, List<String> extensions) {
+        return matchesExtension(file, extensions, true);
+    }
+
+    static boolean matchesExtension(Path file, List<String> extensions, boolean requireTextWhenEmpty) {
         if (extensions.isEmpty()) {
-            return FileTypeUtil.isTextFile(file);
+            return !requireTextWhenEmpty || FileTypeUtil.isTextFile(file);
         }
         String ext = FileTypeUtil.extensionOf(file.getFileName().toString());
         for (String entry : extensions) {
-            String normalized = entry.startsWith(".") ? entry.toLowerCase() : "." + entry.toLowerCase();
+            String token = entry.trim();
+            if (token.isEmpty()) {
+                continue;
+            }
+            // "*.java" / ".java" / "java" を許容
+            if (token.startsWith("*.")) {
+                token = token.substring(1);
+            }
+            String normalized = token.startsWith(".") ? token.toLowerCase() : "." + token.toLowerCase();
             if (normalized.equals(ext)) {
                 return true;
             }

@@ -149,7 +149,8 @@ final class FavoritesPanel extends JPanel {
                 label,
                 preset.pathPatterns(),
                 preset.filePatterns(),
-                preset.extensions()
+                preset.extensions(),
+                preset.directoriesOnly()
         ));
         rebuildTree();
         onChanged.run();
@@ -792,7 +793,8 @@ final class FavoritesPanel extends JPanel {
                 applySearch.accept(new BookmarkSearchPreset(
                         node.searchPathPatterns(),
                         node.searchFilePatterns(),
-                        node.searchExtensions()
+                        node.searchExtensions(),
+                        node.searchDirectoriesOnly()
                 ));
                 runSearch.run();
             }

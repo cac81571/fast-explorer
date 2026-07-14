@@ -23,6 +23,7 @@ public final class BookmarkNode {
     private String searchPathPatterns = "";
     private String searchFilePatterns = "";
     private String searchExtensions = "";
+    private boolean searchDirectoriesOnly;
     private String grepPattern = "";
     private String grepPath = "";
     private String grepFile = "";
@@ -55,12 +56,14 @@ public final class BookmarkNode {
             String name,
             String pathPatterns,
             String filePatterns,
-            String extensions
+            String extensions,
+            boolean directoriesOnly
     ) {
         BookmarkNode node = new BookmarkNode(Kind.SEARCH, name);
         node.searchPathPatterns = nullToEmpty(pathPatterns);
         node.searchFilePatterns = nullToEmpty(filePatterns);
         node.searchExtensions = nullToEmpty(extensions);
+        node.searchDirectoriesOnly = directoriesOnly;
         return node;
     }
 
@@ -123,6 +126,10 @@ public final class BookmarkNode {
 
     public String searchExtensions() {
         return searchExtensions;
+    }
+
+    public boolean searchDirectoriesOnly() {
+        return searchDirectoriesOnly;
     }
 
     public String grepPattern() {
@@ -191,6 +198,9 @@ public final class BookmarkNode {
         }
         if (!searchExtensions.isBlank()) {
             parts.add("拡張子=" + searchExtensions);
+        }
+        if (searchDirectoriesOnly) {
+            parts.add("フォルダのみ");
         }
         return String.join(" ", parts);
     }

@@ -20,6 +20,9 @@ public final class SearchMatcher {
         if (options.isEmpty()) {
             return true;
         }
+        if (options.directoriesOnly() && !isDirectory) {
+            return false;
+        }
         if (!options.pathPatterns().isEmpty()) {
             String relativePath = relativizePath(root, entryPath);
             if (!matchesAnyGlob(relativePath, options.pathPatterns())) {
@@ -30,6 +33,10 @@ public final class SearchMatcher {
             if (!matchesAnyGlob(name, options.fileNamePatterns())) {
                 return false;
             }
+        }
+        if (options.directoriesOnly()) {
+            // フォルダのみ: 拡張子条件は適用しない
+            return true;
         }
         if (!options.extensions().isEmpty()) {
             if (isDirectory) {

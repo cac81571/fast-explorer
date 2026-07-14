@@ -60,7 +60,8 @@ public final class BookmarkStore {
                             field(parts, 1),
                             field(parts, 2),
                             field(parts, 3),
-                            field(parts, 4)
+                            field(parts, 4),
+                            "1".equals(field(parts, 5))
                     ));
                     case "G" -> appendChild(stack, roots, BookmarkNode.grep(
                             field(parts, 1),
@@ -174,7 +175,8 @@ public final class BookmarkStore {
                     + nullToEmpty(node.name()) + "\t"
                     + nullToEmpty(node.searchPathPatterns()) + "\t"
                     + nullToEmpty(node.searchFilePatterns()) + "\t"
-                    + nullToEmpty(node.searchExtensions()));
+                    + nullToEmpty(node.searchExtensions()) + "\t"
+                    + (node.searchDirectoriesOnly() ? "1" : "0"));
             case GREP -> lines.add("G\t"
                     + nullToEmpty(node.name()) + "\t"
                     + nullToEmpty(node.grepPattern()) + "\t"
