@@ -259,6 +259,13 @@ public class ExplorerFrame extends JFrame {
                 openFileOnServer(entry.path());
             }
         });
+        JMenuItem openInExplorerItem = new JMenuItem("エクスプローラで開く");
+        openInExplorerItem.addActionListener(e -> {
+            FileEntry entry = getSelectedEntry();
+            if (entry != null) {
+                openInExplorer(entry.path());
+            }
+        });
         JMenuItem copyPathItem = new JMenuItem("パスのコピー");
         copyPathItem.addActionListener(e -> {
             FileEntry entry = getSelectedEntry();
@@ -267,6 +274,7 @@ public class ExplorerFrame extends JFrame {
             }
         });
         popup.add(openServerFileItem);
+        popup.add(openInExplorerItem);
         popup.add(copyPathItem);
 
         table.addMouseListener(new MouseAdapter() {
@@ -1929,6 +1937,32 @@ public class ExplorerFrame extends JFrame {
         openFile(path, false);
     }
 
+    /** Windows エクスプローラで開く（ファイルは選択表示、フォルダはその場所を開く）。 */
+    private void openInExplorer(Path path) {
+        if (path == null) {
+            return;
+        }
+        try {
+            Path resolved = PathUtil.resolveForAccess(path);
+            String display = PathUtil.toDisplay(resolved);
+            if (PathUtil.isWindows()) {
+                boolean isDirectory = Files.isDirectory(resolved);
+                ProcessBuilder builder = isDirectory
+                        ? new ProcessBuilder("explorer.exe", display)
+                        : new ProcessBuilder("explorer.exe", "/select,", display);
+                builder.start();
+            } else {
+                Path target = Files.isDirectory(resolved)
+                        ? resolved
+                        : (resolved.getParent() != null ? resolved.getParent() : resolved);
+                Desktop.getDesktop().open(target.toFile());
+            }
+            statusLabel.setText("エクスプローラで開きました: " + display);
+        } catch (IOException ex) {
+            showError(formatError(ex));
+        }
+    }
+
     private void updateStatusBar(Long elapsedMs, String mode) {
         int visible = table.getRowCount();
         String countText = visible == totalEntryCount
@@ -2391,6 +2425,13 @@ public class ExplorerFrame extends JFrame {
                     openFileOnServer(path);
                 }
             });
+            JMenuItem openInExplorerItem = new JMenuItem("エクスプローラで開く");
+            openInExplorerItem.addActionListener(e -> {
+                Path path = selectedPath();
+                if (path != null) {
+                    openInExplorer(path);
+                }
+            });
             JMenuItem copyPath = new JMenuItem("パスのコピー");
             copyPath.addActionListener(e -> {
                 Path path = selectedPath();
@@ -2406,6 +2447,7 @@ public class ExplorerFrame extends JFrame {
                 }
             });
             popup.add(openServerFileItem);
+            popup.add(openInExplorerItem);
             popup.add(copyPath);
             popup.add(copyLine);
 
